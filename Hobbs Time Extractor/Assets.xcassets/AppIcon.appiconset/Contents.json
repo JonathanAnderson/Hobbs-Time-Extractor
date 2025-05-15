@@ -1,6 +1,7 @@
 {
   "images" : [
     {
+      "filename" : "Hobbs Time Extractor 1025.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -12,6 +13,7 @@
           "value" : "dark"
         }
       ],
+      "filename" : "Hobbs Time Extractor 1024 Dark.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -23,56 +25,67 @@
           "value" : "tinted"
         }
       ],
+      "filename" : "Hobbs Time Extractor 1024 Dark 1.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
     },
     {
+      "filename" : "Hobbs Time Extractor 16.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "16x16"
     },
     {
+      "filename" : "Hobbs Time Extractor 32.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "16x16"
     },
     {
+      "filename" : "Hobbs Time Extractor 33.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "32x32"
     },
     {
+      "filename" : "Hobbs Time Extractor 64.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "32x32"
     },
     {
+      "filename" : "Hobbs Time Extractor 128.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "128x128"
     },
     {
+      "filename" : "Hobbs Time Extractor 256.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "128x128"
     },
     {
+      "filename" : "Hobbs Time Extractor 257.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "256x256"
     },
     {
+      "filename" : "Hobbs Time Extractor 512.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "256x256"
     },
     {
+      "filename" : "Hobbs Time Extractor 513.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "512x512"
     },
     {
+      "filename" : "Hobbs Time Extractor 1024.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "512x512"
