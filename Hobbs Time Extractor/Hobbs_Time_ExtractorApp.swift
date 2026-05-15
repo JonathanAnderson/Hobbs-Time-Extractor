@@ -12,6 +12,7 @@ struct Hobbs_Time_ExtractorApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .frame(minWidth: 380, minHeight: 260)
         }
     }
 }

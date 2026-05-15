@@ -1,13 +1,30 @@
 //
 //  GarminExtractor.swift
-//  Time Extractor
+//  Time Extractor
 //
 //  Created by Jonathan Anderson on 5/13/25.
 //
 
 import Foundation
 
-/// A fast sequence that yields one line (without the newline) at a time.
+// MARK: - Shared types
+
+public struct Coordinate: Hashable {
+    public let latitude: Double
+    public let longitude: Double
+}
+
+/// One data row yielded by GarminTimeReader.
+public struct GarminRow {
+    public let epochSec: Int
+    /// Latitude in decimal degrees, present only when GPSfix=="3DDiff", HPLwas<100, VPLwas<100.
+    public let latitude: Double?
+    public let longitude: Double?
+}
+
+// MARK: - GarminTimeReader
+
+/// Streaming iterator over a Garmin G1000 CSV. Yields one GarminRow per data line.
 public class GarminTimeReader: Sequence, IteratorProtocol {
     private let fileHandle: FileHandle
     private let bufferSize: Int
@@ -15,11 +32,19 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
     private let url: URL
     private let hasAccess: Bool
     private var lineNo: Int = 0
+    private let parser = GarminTimestampParser()
+    private var colIndices: ColumnIndices?
+
+    private struct ColumnIndices {
+        let latitude: Int
+        let longitude: Int
+        let gpsFix: Int
+        let hplWas: Int
+        let vplWas: Int
+    }
 
     public init?(url: URL, bufferSize: Int = 4_096) {
-        // Acquire security-scoped access
         let access = url.startAccessingSecurityScopedResource()
-        // Ensure we have permission and can open the file
         guard access, let handle = try? FileHandle(forReadingFrom: url) else {
             if access { url.stopAccessingSecurityScopedResource() }
             return nil
@@ -32,189 +57,194 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
 
     deinit {
         try? fileHandle.close()
-        if hasAccess {
-            url.stopAccessingSecurityScopedResource()
-        }
+        if hasAccess { url.stopAccessingSecurityScopedResource() }
     }
 
-    public func next() -> Int? {
+    public func next() -> GarminRow? {
         while true {
-            if let range = buffer.range(of: Data([0x0A])) { // 0x0A == '\n'
+            if let range = buffer.range(of: Data([0x0A])) {
                 lineNo += 1
+                let line = buffer[..<range.lowerBound]
+
                 if lineNo == 1 {
                     let magic = Data("#airframe_info".utf8)
-                    if buffer.subdata(in: 0..<magic.count) != magic {
-                        return nil
-                    }
+                    if buffer.subdata(in: 0..<magic.count) != magic { return nil }
                 } else if lineNo == 2 {
                     let magic = Data("#yyy-mm-dd, hh:mm:ss,   hh:mm,".utf8)
-                    if buffer.subdata(in: 0..<magic.count) != magic {
-                        return nil
-                    }
+                    if buffer.subdata(in: 0..<magic.count) != magic { return nil }
                 } else if lineNo == 3 {
                     let magic = Data("  Lcl Date, Lcl Time, UTCOfst,".utf8)
-                    if buffer.subdata(in: 0..<magic.count) != magic {
-                        return nil
-                    }
+                    if buffer.subdata(in: 0..<magic.count) != magic { return nil }
+                    colIndices = parseColumnIndices(line)
                 }
+
                 if lineNo < 4 {
                     buffer.removeSubrange(0..<range.upperBound)
                     continue
                 }
-                let epochsec = epochsec_from_buffer(buffer: buffer)
+
+                let epochSec = parser.parse(buffer)
+                let gps = colIndices.flatMap { parseGPS(line, indices: $0) }
                 buffer.removeSubrange(0..<range.upperBound)
-                return epochsec
-            }
-            else {
-                // No newline in buffer: attempt to read more data
+                return GarminRow(epochSec: epochSec, latitude: gps?.lat, longitude: gps?.lon)
+            } else {
                 guard let chunk = try? fileHandle.read(upToCount: bufferSize),
-                      !chunk.isEmpty else {
-                    // EOF reached or read error: end iteration
-                    return nil
-                }
+                      !chunk.isEmpty else { return nil }
                 buffer.append(chunk)
             }
         }
     }
 
-    private func epochsec_from_buffer(buffer: Data) -> Int {
+    private func parseColumnIndices(_ line: Data) -> ColumnIndices? {
+        guard let s = String(data: line, encoding: .ascii) else { return nil }
+        var map: [String: Int] = [:]
+        for (i, col) in s.split(separator: ",", omittingEmptySubsequences: false).enumerated() {
+            map[col.trimmingCharacters(in: .whitespaces)] = i
+        }
+        guard let lat = map["Latitude"], let lon = map["Longitude"],
+              let fix = map["GPSfix"],  let hpl = map["HPLwas"], let vpl = map["VPLwas"]
+        else { return nil }
+        return ColumnIndices(latitude: lat, longitude: lon, gpsFix: fix, hplWas: hpl, vplWas: vpl)
+    }
+
+    private func parseGPS(_ line: Data, indices: ColumnIndices) -> (lat: Double, lon: Double)? {
+        guard let s = String(data: line, encoding: .ascii) else { return nil }
+        let cols = s.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard cols.count > indices.latitude,
+              cols.count > indices.longitude,
+              cols.count > indices.gpsFix,
+              cols.count > indices.hplWas,
+              cols.count > indices.vplWas else { return nil }
+        guard cols[indices.gpsFix] == "3DDiff",
+              let hpl = Double(cols[indices.hplWas]), hpl < 100,
+              let vpl = Double(cols[indices.vplWas]), vpl < 100 else { return nil }
+        let latStr = cols[indices.latitude], lonStr = cols[indices.longitude]
+        guard !latStr.isEmpty, !lonStr.isEmpty,
+              let lat = Double(latStr), let lon = Double(lonStr) else { return nil }
+        return (lat, lon)
+    }
+}
+
+// MARK: - GarminTimestampParser
+
+/// Parses a single Garmin G1000 CSV data row (cols 0–2) into a UTC epoch second.
+/// Zero-state value type; no Calendar or DateFormatter — safe to call in tight loops.
+public struct GarminTimestampParser {
+    // Input layout (first 30 bytes):
+    //   0123456789012345678901234567890
+    //             ,         ,        ,
+    //   2025-03-17, 09:59:11,  -05:00,
+    public func parse(_ buffer: Data) -> Int {
         var yyyy: Int32 = 0
-        var mo: Int32 = 0
-        var dd: Int32 = 0
-        var hh: Int32 = 0
-        var mi: Int32 = 0
-        var ss: Int32 = 0
-        var tzs: Int32 = 1
-        var tzh: Int32 = 0
-        var tzm: Int32 = 0
+        var mo:   Int32 = 0
+        var dd:   Int32 = 0
+        var hh:   Int32 = 0
+        var mi:   Int32 = 0
+        var ss:   Int32 = 0
+        var tzs:  Int32 = 1
+        var tzh:  Int32 = 0
+        var tzm:  Int32 = 0
 
         let skip: Set<UInt8> = [UInt8(ascii: " "), UInt8(ascii: ","), UInt8(ascii: ":")]
 
         for (idx, byte) in buffer.enumerated() {
-            //0123456789012345678901234567890
-            //          ,         ,        ,
-            //2025-03-17, 09:59:11,  -05:00,
             if idx >= 30 { break }
             if skip.contains(byte) { continue }
             if idx > 20 {
-                if byte == UInt8(ascii: "-") {
-                    tzs = -1
-                    continue
-                } else if byte == UInt8(ascii: "+") {
-                    tzs = 1
-                    continue
-                }
+                if byte == UInt8(ascii: "-") { tzs = -1; continue }
+                if byte == UInt8(ascii: "+") { tzs =  1; continue }
             } else if byte == UInt8(ascii: "-") { continue }
 
-            let digit: Int32 = Int32(byte) - Int32(UInt8(ascii: "0"))
+            let digit = Int32(byte) - Int32(UInt8(ascii: "0"))
             if digit < 0 || digit > 9 { return 0 }
 
-            if idx < 4 { // yyyy
-                yyyy = yyyy * 10 + digit
-                continue
-            }
-            if idx < 7 { // MM
-                mo = mo * 10 + digit
-                continue
-            }
-            if idx < 10 { // dd
-                dd = dd * 10 + digit
-                continue
-            }
-            if idx < 14 { // hh
-                hh = hh * 10 + digit
-                continue
-            }
-            if idx < 17 { // mi
-                mi = mi * 10 + digit
-                continue
-            }
-            if idx < 20 { // ss
-                ss = ss * 10 + digit
-                continue
-            }
-            if idx < 26 { // tzh
-                tzh = tzh * 10 + digit
-                continue
-            }
-            if idx < 29 { // tzm
-                tzm = tzm * 10 + digit
-                continue
-            }
+            if idx <  4 { yyyy = yyyy * 10 + digit; continue }
+            if idx <  7 { mo   = mo   * 10 + digit; continue }
+            if idx < 10 { dd   = dd   * 10 + digit; continue }
+            if idx < 14 { hh   = hh   * 10 + digit; continue }
+            if idx < 17 { mi   = mi   * 10 + digit; continue }
+            if idx < 20 { ss   = ss   * 10 + digit; continue }
+            if idx < 26 { tzh  = tzh  * 10 + digit; continue }
+            if idx < 29 { tzm  = tzm  * 10 + digit; continue }
         }
         if yyyy < 2020 || yyyy > 2100 { return 0 }
-        let epochDay: Int = epoch_from_yyyy_mm_dd(yyyy: yyyy, mm: mo, dd: dd) * 24 * 3600
-        let tzOffsetSec: Int = Int(tzs * (tzh * 3600 + tzm * 60))
-        let epochSec: Int = Int(hh * 3600 + mi * 60 + ss)
-        return epochDay + epochSec - tzOffsetSec
+        let dayEpoch    = epochDay(yyyy: yyyy, mm: mo, dd: dd) * 24 * 3600
+        let tzOffsetSec = Int(tzs * (tzh * 3600 + tzm * 60))
+        let timeSec     = Int(hh * 3600 + mi * 60 + ss)
+        return dayEpoch + timeSec - tzOffsetSec
     }
 
-    private func epoch_from_yyyy_mm_dd(yyyy: Int32, mm: Int32, dd: Int32) -> Int {
+    // Proleptic Gregorian calendar → days since Unix epoch.
+    // Uses integer arithmetic only; avoids Calendar overhead in the hot path.
+    private func epochDay(yyyy: Int32, mm: Int32, dd: Int32) -> Int {
         var y = yyyy
         var m = mm
-        if m < 3 {
-            y = y - 1
-            m = m + 9
-        } else {
-            m  = m - 3
-        }
+        if m < 3 { y -= 1; m += 9 } else { m -= 3 }
         let value = Int32(y * 1461 / 4) + Int32((m * 979 + 15) / 32) + dd - 719484
         return Int(value)
     }
 }
 
-/// Immutable result for one CSV
+// MARK: - FlightTime
+
+/// Immutable result for one CSV file.
 public struct FlightTime {
     public let fileName: String
     public let start: String
     public let end: String
     public let dt: String
+    /// First GPS fix meeting quality criteria (GPSfix==3DDiff, HPL<100, VPL<100).
+    public let firstCoordinate: Coordinate?
+    /// Last GPS fix meeting quality criteria.
+    public let lastCoordinate: Coordinate?
 }
 
-/// All parsing/epoch‑logic lives here; UI just calls this.
+// MARK: - GarminExtractor
+
+/// All parsing logic lives here; UI just calls extract(from:).
 public enum GarminExtractor {
     private static let df: DateFormatter = {
         let f = DateFormatter()
-        // No timezone specifier: prints in UTC but without “+0000”
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         f.locale     = Locale(identifier: "en_US_POSIX")
         f.timeZone   = TimeZone(secondsFromGMT: 0)
         return f
     }()
-    /// Reads the file at `url`, skips “#” lines, pulls cols 0–2, and returns a FlightTime.
+
     public static func extract(from url: URL) -> FlightTime {
-       // Ask the sandbox for temporary read access
         let hasAccess = url.startAccessingSecurityScopedResource()
-        defer {
-            if hasAccess {
-                url.stopAccessingSecurityScopedResource()
-            }
+        defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+
+        guard let reader = GarminTimeReader(url: url) else {
+            return FlightTime(fileName: url.lastPathComponent,
+                              start: "N/A", end: "N/A", dt: "",
+                              firstCoordinate: nil, lastCoordinate: nil)
         }
 
-        // Stream-read times using the iterator protocol
-        guard let reader = GarminTimeReader(url: url) else {
-            return FlightTime(fileName: url.lastPathComponent, start: "N/A", end: "N/A", dt: "")
-        }
-        var beg: Int = 0
-        var end: Int = 0
-        var missingCount = 0;
-        for epochsec in reader {
-            guard epochsec > 24 * 3600 * 365 else {
-                missingCount += 1;
-                continue
-            }
+        var beg = 0, end = 0, missingCount = 0
+        var firstCoord: Coordinate? = nil
+        var lastCoord:  Coordinate? = nil
+
+        for row in reader {
+            guard row.epochSec > 24 * 3600 * 365 else { missingCount += 1; continue }
             if beg == 0 {
-                beg = epochsec - missingCount
-                end = epochsec
-                continue
+                beg = row.epochSec - missingCount
+                end = row.epochSec
+            } else if row.epochSec > end {
+                end = row.epochSec
             }
-            if epochsec > end { end = epochsec }
+            if let lat = row.latitude, let lon = row.longitude {
+                if firstCoord == nil { firstCoord = Coordinate(latitude: lat, longitude: lon) }
+                lastCoord = Coordinate(latitude: lat, longitude: lon)
+            }
         }
 
         let begStr = df.string(from: Date(timeIntervalSince1970: TimeInterval(beg)))
         let endStr = df.string(from: Date(timeIntervalSince1970: TimeInterval(end)))
-        let dt = Double(end - beg) / 3600
-        let dtStr = String(format: "%.1f", dt)
-        return FlightTime(fileName: url.lastPathComponent, start: begStr, end: endStr, dt: dtStr)
+        let dtStr  = String(format: "%.1f", Double(end - beg) / 3600)
+        return FlightTime(fileName: url.lastPathComponent,
+                          start: begStr, end: endStr, dt: dtStr,
+                          firstCoordinate: firstCoord, lastCoordinate: lastCoord)
     }
 }
