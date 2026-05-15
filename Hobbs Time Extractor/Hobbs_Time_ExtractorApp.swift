@@ -2,13 +2,25 @@
 //  Hobbs_Time_ExtractorApp.swift
 //  Hobbs Time Extractor
 //
-//  Created by Jonathan Anderson on 5/14/25.
+//  Updated by Jonathan Anderson on 5/15/26.
 //
 
 import SwiftUI
 
+// Required on iPhone (iOS 16+) for portrait-upside-down to be honoured at runtime.
+class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        [.portrait, .portraitUpsideDown]
+    }
+}
+
 @main
 struct Hobbs_Time_ExtractorApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
