@@ -31,11 +31,7 @@
       shouldAutocreateTestPlan = "YES">
    </TestAction>
    <LaunchAction
-<<<<<<< HEAD
-      buildConfiguration = "Release"
-=======
       buildConfiguration = "Debug"
->>>>>>> 6bb4cc9 (updated)
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       launchStyle = "0"
