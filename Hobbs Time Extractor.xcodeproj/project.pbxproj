@@ -6,7 +6,12 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		78EEBCD7AF7C4D55BEF11FEC /* Hobbs Time Extractor/SampleData in Resources */ = {isa = PBXBuildFile; fileRef = 02775E568E5344FA93528DC7 /* Hobbs Time Extractor/SampleData */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
+		02775E568E5344FA93528DC7 /* Hobbs Time Extractor/SampleData */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "Hobbs Time Extractor/SampleData"; sourceTree = "<group>"; };
 		5A06AB0D2DD559D200C038A1 /* Hobbs Time Extractor.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Hobbs Time Extractor.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -33,6 +38,7 @@
 			isa = PBXGroup;
 			children = (
 				5A06AB0F2DD559D200C038A1 /* Hobbs Time Extractor */,
+				02775E568E5344FA93528DC7 /* Hobbs Time Extractor/SampleData */,
 				5A06AB0E2DD559D200C038A1 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -55,6 +61,7 @@
 				5A06AB092DD559D200C038A1 /* Sources */,
 				5A06AB0A2DD559D200C038A1 /* Frameworks */,
 				5A06AB0B2DD559D200C038A1 /* Resources */,
+				7604A24DCA284C12A3EF9DA9 /* Copy SampleData (Debug only) */,
 			);
 			buildRules = (
 			);
@@ -111,6 +118,26 @@
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7604A24DCA284C12A3EF9DA9 /* Copy SampleData (Debug only) */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Hobbs Time Extractor/SampleData",
+			);
+			name = "Copy SampleData (Debug only)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/SampleData",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ \"$CONFIGURATION\" = \"Debug\" ]; then\n\tmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/SampleData\"\n\trsync -a \"${SRCROOT}/Hobbs Time Extractor/SampleData/\" \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/SampleData/\"\nfi\n";
 		};
 /* End PBXResourcesBuildPhase section */
 
@@ -271,6 +298,10 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+<<<<<<< HEAD
+=======
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+>>>>>>> 137c03c (updated)
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";

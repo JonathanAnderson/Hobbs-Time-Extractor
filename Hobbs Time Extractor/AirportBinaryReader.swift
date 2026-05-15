@@ -7,7 +7,7 @@ import Foundation
 
 // MARK: - AirportRecord
 
-struct AirportRecord: Identifiable, Hashable {
+struct AirportRecord: Identifiable, Hashable, Sendable {
     let identifier: String
     let latitudeDegrees: Double
     let longitudeDegrees: Double
@@ -215,38 +215,56 @@ final class AirportBinaryReader {
 
 // MARK: - Nearest airport search
 
-struct AirportSearchResult {
+struct AirportSearchResult: Sendable {
     let airport: AirportRecord
     let distanceKilometers: Double
 }
 
-func unitVector(latitudeDegrees: Double, longitudeDegrees: Double) -> (x: Double, y: Double, z: Double) {
-    let latRad = latitudeDegrees * .pi / 180.0
-    let lonRad = longitudeDegrees * .pi / 180.0
-    let cosLat = cos(latRad)
-    return (x: cosLat * cos(lonRad), y: cosLat * sin(lonRad), z: sin(latRad))
-}
-
+// Airports array must be sorted by latitudeDegrees ascending (as written by faa_airports.py).
+// Searches within 10 km; returns nil if no airport is that close.
 func nearestAirport(
     latitudeDegrees: Double,
     longitudeDegrees: Double,
     airports: [AirportRecord]
 ) -> AirportSearchResult? {
-    let current = unitVector(latitudeDegrees: latitudeDegrees, longitudeDegrees: longitudeDegrees)
-    var bestAirport: AirportRecord?
-    var bestChordSquared = Double.infinity
+    guard !airports.isEmpty else { return nil }
 
-    for airport in airports {
-        var dot = current.x * airport.unitX + current.y * airport.unitY + current.z * airport.unitZ
-        dot = min(1.0, max(-1.0, dot))
-        let chordSquared = 2.0 - 2.0 * dot
-        if chordSquared < bestChordSquared {
-            bestChordSquared = chordSquared
-            bestAirport = airport
-        }
+    let maxKm    = 10.0
+    let latDelta = 0.10                                        // ~11 km — safe for all latitudes
+    let latRad   = latitudeDegrees * .pi / 180.0
+    let cosLat   = max(cos(latRad), 0.01)                     // clamp near poles
+    let lonDelta = maxKm / (111.32 * cosLat)                  // widens toward poles
+    let minLat   = latitudeDegrees - latDelta
+    let maxLat   = latitudeDegrees + latDelta
+    let minLon   = longitudeDegrees - lonDelta
+    let maxLon   = longitudeDegrees + lonDelta
+
+    // Binary search: first airport with latitudeDegrees >= minLat
+    var lo = 0, hi = airports.count
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if airports[mid].latitudeDegrees < minLat { lo = mid + 1 } else { hi = mid }
     }
 
-    guard let bestAirport else { return nil }
-    let distanceKilometers = sqrt(bestChordSquared) * 6371.0088
-    return AirportSearchResult(airport: bestAirport, distanceKilometers: distanceKilometers)
+    // Chord-squared threshold for 10 km (avoids acos in the inner loop)
+    let maxChordSq = (maxKm / 6371.0088) * (maxKm / 6371.0088)
+    let lonRad = longitudeDegrees * .pi / 180.0
+    let qx = cosLat * cos(lonRad)
+    let qy = cosLat * sin(lonRad)
+    let qz = sin(latRad)
+
+    var bestAirport: AirportRecord?
+    var bestChordSq = maxChordSq
+
+    for i in lo..<airports.count {
+        let a = airports[i]
+        guard a.latitudeDegrees <= maxLat else { break }
+        guard a.longitudeDegrees >= minLon && a.longitudeDegrees <= maxLon else { continue }
+        let dot = min(1.0, max(-1.0, qx * a.unitX + qy * a.unitY + qz * a.unitZ))
+        let chordSq = 2.0 - 2.0 * dot
+        if chordSq < bestChordSq { bestChordSq = chordSq; bestAirport = a }
+    }
+
+    guard let best = bestAirport else { return nil }
+    return AirportSearchResult(airport: best, distanceKilometers: sqrt(bestChordSq) * 6371.0088)
 }

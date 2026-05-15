@@ -9,23 +9,23 @@ import Foundation
 
 // MARK: - Shared types
 
-public struct Coordinate: Hashable {
-    public let latitude: Double
-    public let longitude: Double
+struct Coordinate: Hashable, Sendable {
+    let latitude: Double
+    let longitude: Double
 }
 
-public struct GarminRow {
-    public let epochSec: Int
-    public let latitude: Double?
-    public let longitude: Double?
-    public let tas: Double?       // True Airspeed (kt)
-    public let maxFFlow: Double?  // max fuel flow across all FFlow columns (gph)
+struct GarminRow {
+    let epochSec: Int
+    let latitude: Double?
+    let longitude: Double?
+    let tas: Double?       // True Airspeed (kt)
+    let maxFFlow: Double?  // max fuel flow across all FFlow columns (gph)
 }
 
 // MARK: - GarminTimeReader
 
 /// Streaming iterator over a Garmin G1000 CSV. Yields one GarminRow per data line.
-public class GarminTimeReader: Sequence, IteratorProtocol {
+class GarminTimeReader: Sequence, IteratorProtocol {
     private let fileHandle: FileHandle
     private let bufferSize: Int
     private var buffer = Data()
@@ -45,9 +45,10 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
         let fflows: [Int]
     }
 
-    public init?(url: URL, bufferSize: Int = 4_096) {
+    init?(url: URL, bufferSize: Int = 4_096) {
+        // startAccessingSecurityScopedResource returns false for bundle URLs (not an error).
         let access = url.startAccessingSecurityScopedResource()
-        guard access, let handle = try? FileHandle(forReadingFrom: url) else {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
             if access { url.stopAccessingSecurityScopedResource() }
             return nil
         }
@@ -62,7 +63,7 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
         if hasAccess { url.stopAccessingSecurityScopedResource() }
     }
 
-    public func next() -> GarminRow? {
+    func next() -> GarminRow? {
         while true {
             if let range = buffer.range(of: Data([0x0A])) {
                 lineNo += 1
@@ -158,12 +159,12 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
 
 /// Parses a single Garmin G1000 CSV data row (cols 0–2) into a UTC epoch second.
 /// Zero-state value type; no Calendar or DateFormatter — safe to call in tight loops.
-public struct GarminTimestampParser {
+struct GarminTimestampParser {
     // Input layout (first 30 bytes):
     //   0123456789012345678901234567890
     //             ,         ,        ,
     //   2025-03-17, 09:59:11,  -05:00,
-    public func parse(_ buffer: Data) -> Int {
+    func parse(_ buffer: Data) -> Int {
         var yyyy: Int32 = 0
         var mo:   Int32 = 0
         var dd:   Int32 = 0
@@ -215,39 +216,37 @@ public struct GarminTimestampParser {
 // MARK: - FlightTime
 
 /// Immutable result for one CSV file.
-public struct FlightTime {
-    public let fileName: String
+struct FlightTime: Sendable {
+    let fileName: String
     // UTC epoch seconds (0 = not detected)
-    public let onDutyEpoch:  Int
-    public let offDutyEpoch: Int
-    public let timeOutEpoch: Int
-    public let timeInEpoch:  Int
-    public let timeOffEpoch: Int
-    public let timeOnEpoch:  Int
+    let onDutyEpoch:  Int
+    let offDutyEpoch: Int
+    let timeOutEpoch: Int
+    let timeInEpoch:  Int
+    let timeOffEpoch: Int
+    let timeOnEpoch:  Int
     // Formatted "HH:mm" UTC display strings ("—" if not detected)
-    public let onDuty:  String
-    public let offDuty: String
-    public let timeOut: String
-    public let timeIn:  String
-    public let timeOff: String
-    public let timeOn:  String
+    let onDuty:  String
+    let offDuty: String
+    let timeOut: String
+    let timeIn:  String
+    let timeOff: String
+    let timeOn:  String
     // "yyyy-MM-dd" UTC date of the On Duty event
-    public let date: String
+    let date: String
     // Hobbs = (offDuty − onDuty) / 3600, formatted "H.h"
-    public let dt: String
-    /// First GPS fix meeting quality criteria.
-    public let firstCoordinate: Coordinate?
-    /// Last GPS fix meeting quality criteria.
-    public let lastCoordinate: Coordinate?
+    let dt: String
+    let firstCoordinate: Coordinate?
+    let lastCoordinate: Coordinate?
     // Debug: always populated, helps diagnose missed detections
-    public let dbgMaxTas:  Double   // highest TAS seen in file (need >60 for flight)
-    public let dbgFfCount: Int      // data points with FFlow seen
-    public let dbgFfMax:   Double   // highest fuel flow seen (need >5 for engine)
+    let dbgMaxTas:  Double   // highest TAS seen in file (need >60 for flight)
+    let dbgFfCount: Int      // data points with FFlow seen
+    let dbgFfMax:   Double   // highest fuel flow seen (need >5 for engine)
 }
 
 // MARK: - GarminExtractor
 
-public enum GarminExtractor {
+enum GarminExtractor {
     private static let timeFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm"
@@ -274,7 +273,7 @@ public enum GarminExtractor {
         return dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
     }
 
-    public static func extract(from url: URL) -> FlightTime {
+    static func extract(from url: URL) -> FlightTime {
         func na() -> FlightTime {
             FlightTime(
                 fileName: url.lastPathComponent,

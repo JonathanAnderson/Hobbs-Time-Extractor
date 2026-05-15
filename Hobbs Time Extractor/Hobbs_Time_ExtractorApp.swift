@@ -7,6 +7,12 @@
 
 import SwiftUI
 
+<<<<<<< HEAD
+=======
+#if canImport(UIKit)
+import UIKit
+
+>>>>>>> 137c03c (updated)
 // Required on iPhone (iOS 16+) for portrait-upside-down to be honoured at runtime.
 class AppDelegate: NSObject, UIApplicationDelegate {
     func application(
@@ -16,10 +22,20 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         [.portrait, .portraitUpsideDown]
     }
 }
+<<<<<<< HEAD
 
 @main
 struct Hobbs_Time_ExtractorApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+=======
+#endif
+
+@main
+struct Hobbs_Time_ExtractorApp: App {
+    #if canImport(UIKit)
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    #endif
+>>>>>>> 137c03c (updated)
 
     var body: some Scene {
         WindowGroup {

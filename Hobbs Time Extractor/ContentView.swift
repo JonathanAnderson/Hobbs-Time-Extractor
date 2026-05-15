@@ -12,23 +12,13 @@ import Foundation
 // MARK: - FlightRecord
 
 /// FlightTime paired with its nearest departure/arrival airports and distances.
-struct FlightRecord: Identifiable {
+struct FlightRecord: Identifiable, Sendable {
     let flight: FlightTime
     let departure: AirportRecord?
     let arrival: AirportRecord?
     let departureDistanceKm: Double?
     let arrivalDistanceKm: Double?
     var id: String { flight.fileName }
-}
-
-// MARK: - Sort order
-
-enum FlightSortOrder: String, CaseIterable, Identifiable {
-    case importOrder = "Added"
-    case fileName    = "Name"
-    case startTime   = "Date"
-    case duration    = "Duration"
-    var id: String { rawValue }
 }
 
 // MARK: - ContentView
@@ -38,14 +28,13 @@ struct ContentView: View {
     @State private var records: [FlightRecord] = []
     @State private var airports: [AirportRecord] = []
     @State private var errorMessage: String?
-    @State private var sortOrder: FlightSortOrder = .importOrder
+    @State private var sortAscending = true
 
     private var sorted: [FlightRecord] {
-        switch sortOrder {
-        case .importOrder: return records
-        case .fileName:    return records.sorted { $0.flight.fileName.localizedStandardCompare($1.flight.fileName) == .orderedAscending }
-        case .startTime:   return records.sorted { $0.flight.onDutyEpoch < $1.flight.onDutyEpoch }
-        case .duration:    return records.sorted { (Double($0.flight.dt) ?? 0) > (Double($1.flight.dt) ?? 0) }
+        records.sorted {
+            sortAscending
+                ? $0.flight.onDutyEpoch < $1.flight.onDutyEpoch
+                : $0.flight.onDutyEpoch > $1.flight.onDutyEpoch
         }
     }
 
@@ -70,23 +59,26 @@ struct ContentView: View {
                             .imageScale(.large)
                     }
                 }
+                #if DEBUG
+                ToolbarItem(placement: .automatic) {
+                    Button { loadSamples() } label: {
+                        Label("Samples", systemImage: "tray.and.arrow.down")
+                    }
+                }
+                #endif
                 if !records.isEmpty {
                     ToolbarItem(placement: .automatic) {
-                        Menu {
-                            Picker("Sort by", selection: $sortOrder) {
-                                ForEach(FlightSortOrder.allCases) { order in
-                                    Label(order.rawValue, systemImage: sortIcon(for: order))
-                                        .tag(order)
-                                }
-                            }
-                            Divider()
-                            Button(role: .destructive) {
-                                withAnimation { records.removeAll() }
-                            } label: {
-                                Label("Clear All", systemImage: "trash")
-                            }
+                        Button {
+                            withAnimation { sortAscending.toggle() }
                         } label: {
-                            Label("Sort", systemImage: "arrow.up.arrow.down")
+                            Image(systemName: sortAscending ? "arrow.up" : "arrow.down")
+                        }
+                    }
+                    ToolbarItem(placement: .automatic) {
+                        Button(role: .destructive) {
+                            withAnimation { records.removeAll() }
+                        } label: {
+                            Image(systemName: "trash")
                         }
                     }
                 }
@@ -99,22 +91,7 @@ struct ContentView: View {
                 switch result {
                 case .success(let urls):
                     errorMessage = nil
-                    let existing = Set(records.map { $0.flight.fileName })
-                    let new = urls
-                        .filter { !existing.contains($0.lastPathComponent) }
-                        .map { url -> FlightRecord in
-                            let ft = GarminExtractor.extract(from: url)
-                            let dep = nearestFor(ft.firstCoordinate)
-                            let arr = nearestFor(ft.lastCoordinate)
-                            return FlightRecord(
-                                flight: ft,
-                                departure: dep?.airport,
-                                arrival:   arr?.airport,
-                                departureDistanceKm: dep?.distanceKilometers,
-                                arrivalDistanceKm:   arr?.distanceKilometers
-                            )
-                        }
-                    withAnimation { records.append(contentsOf: new) }
+                    importURLs(urls)
                 case .failure(let error):
                     errorMessage = error.localizedDescription
                 }
@@ -133,8 +110,12 @@ struct ContentView: View {
                 else { return }
                 airports = loaded
                 records = records.map {
-                    let dep = nearestFor($0.flight.firstCoordinate)
-                    let arr = nearestFor($0.flight.lastCoordinate)
+                    let dep = nearestAirport(latitudeDegrees:  $0.flight.firstCoordinate?.latitude  ?? 0,
+                                             longitudeDegrees: $0.flight.firstCoordinate?.longitude ?? 0,
+                                             airports: loaded)
+                    let arr = nearestAirport(latitudeDegrees:  $0.flight.lastCoordinate?.latitude   ?? 0,
+                                             longitudeDegrees: $0.flight.lastCoordinate?.longitude  ?? 0,
+                                             airports: loaded)
                     return FlightRecord(
                         flight: $0.flight,
                         departure: dep?.airport,
@@ -149,25 +130,47 @@ struct ContentView: View {
 
     // MARK: - Helpers
 
-    private func nearestFor(_ coord: Coordinate?) -> AirportSearchResult? {
-        guard let coord, !airports.isEmpty else { return nil }
-        return nearestAirport(
-            latitudeDegrees: coord.latitude,
-            longitudeDegrees: coord.longitude,
-            airports: airports
-        )
-    }
-
-    private func sortIcon(for order: FlightSortOrder) -> String {
-        switch order {
-        case .importOrder: return "clock"
-        case .fileName:    return "textformat.abc"
-        case .startTime:   return "calendar"
-        case .duration:    return "timer"
+    // Parses URLs off the main thread, then appends results on main.
+    private func importURLs(_ urls: [URL]) {
+        let existing  = Set(records.map { $0.flight.fileName })
+        let newURLs   = urls.filter { !existing.contains($0.lastPathComponent) }
+        guard !newURLs.isEmpty else { return }
+        let snap = airports   // capture the already-loaded array; no repeated disk reads
+        Task.detached(priority: .userInitiated) {
+            let new = await withTaskGroup(of: FlightRecord.self) { group in
+                for url in newURLs {
+                    group.addTask {
+                        let ft  = GarminExtractor.extract(from: url)
+                        let dep = nearestAirport(latitudeDegrees:  ft.firstCoordinate?.latitude  ?? 0,
+                                                 longitudeDegrees: ft.firstCoordinate?.longitude ?? 0,
+                                                 airports: snap)
+                        let arr = nearestAirport(latitudeDegrees:  ft.lastCoordinate?.latitude   ?? 0,
+                                                 longitudeDegrees: ft.lastCoordinate?.longitude  ?? 0,
+                                                 airports: snap)
+                        return FlightRecord(flight: ft,
+                                            departure: dep?.airport, arrival: arr?.airport,
+                                            departureDistanceKm: dep?.distanceKilometers,
+                                            arrivalDistanceKm:   arr?.distanceKilometers)
+                    }
+                }
+                var out: [FlightRecord] = []
+                for await r in group { out.append(r) }
+                return out
+            }
+            await MainActor.run { withAnimation { records.append(contentsOf: new) } }
         }
     }
 
-    // MARK: - Subviews
+    #if DEBUG
+    private func loadSamples() {
+        let urls = Bundle.main.urls(forResourcesWithExtension: "csv", subdirectory: "SampleData")
+                ?? Bundle.main.urls(forResourcesWithExtension: "csv", subdirectory: nil)
+                ?? []
+        importURLs(urls)
+    }
+    #endif
+
+// MARK: - Subviews
 
     private var emptyState: some View {
         VStack(spacing: 16) {
@@ -374,13 +377,19 @@ struct FlightRow: View {
 }
 
 private struct FlightListPreview: View {
+    // Epochs derived from display strings: midnight UTC + seconds into day.
+    // 2025-03-17 00:00 UTC = 1742169600
+    // 2025-03-22 00:00 UTC = 1742601600
     @State private var records: [FlightRecord] = [
         FlightRecord(
             flight: FlightTime(
                 fileName: "log_2025-03-17.csv",
-                onDutyEpoch: 1742220000, offDutyEpoch: 1742226120,
-                timeOutEpoch: 1742220300, timeInEpoch: 1742225900,
-                timeOffEpoch: 1742220600, timeOnEpoch: 1742225700,
+                onDutyEpoch:  1742169600 + 14*3600 + 59*60,   // 14:59
+                offDutyEpoch: 1742169600 + 16*3600 + 42*60,   // 16:42
+                timeOutEpoch: 1742169600 + 15*3600 +  4*60,   // 15:04
+                timeInEpoch:  1742169600 + 16*3600 + 38*60,   // 16:38
+                timeOffEpoch: 1742169600 + 15*3600 +  9*60,   // 15:09
+                timeOnEpoch:  1742169600 + 16*3600 + 35*60,   // 16:35
                 onDuty: "14:59", offDuty: "16:42",
                 timeOut: "15:04", timeIn: "16:38",
                 timeOff: "15:09", timeOn: "16:35",
@@ -395,10 +404,11 @@ private struct FlightListPreview: View {
         FlightRecord(
             flight: FlightTime(
                 fileName: "log_2025-03-22.csv",
-                onDutyEpoch: 1742642400, offDutyEpoch: 1742654100,
+                onDutyEpoch:  1742601600 + 13*3600 + 10*60,   // 13:10
+                offDutyEpoch: 1742601600 + 16*3600 + 22*60,   // 16:22  (→ dt 3.2 h)
                 timeOutEpoch: 0, timeInEpoch: 0,
                 timeOffEpoch: 0, timeOnEpoch: 0,
-                onDuty: "13:10", offDuty: "16:25",
+                onDuty: "13:10", offDuty: "16:22",
                 timeOut: "—", timeIn: "—",
                 timeOff: "—", timeOn: "—",
                 date: "2025-03-22",
