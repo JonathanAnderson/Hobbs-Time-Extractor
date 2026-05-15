@@ -11,11 +11,13 @@ import Foundation
 
 // MARK: - FlightRecord
 
-/// FlightTime paired with its nearest departure/arrival airports (nil until airport DB loads).
+/// FlightTime paired with its nearest departure/arrival airports and distances.
 struct FlightRecord: Identifiable {
     let flight: FlightTime
     let departure: AirportRecord?
     let arrival: AirportRecord?
+    let departureDistanceKm: Double?
+    let arrivalDistanceKm: Double?
     var id: String { flight.fileName }
 }
 
@@ -42,13 +44,9 @@ struct ContentView: View {
         switch sortOrder {
         case .importOrder: return records
         case .fileName:    return records.sorted { $0.flight.fileName.localizedStandardCompare($1.flight.fileName) == .orderedAscending }
-        case .startTime:   return records.sorted { $0.flight.start < $1.flight.start }
+        case .startTime:   return records.sorted { $0.flight.onDutyEpoch < $1.flight.onDutyEpoch }
         case .duration:    return records.sorted { (Double($0.flight.dt) ?? 0) > (Double($1.flight.dt) ?? 0) }
         }
-    }
-
-    private var maxDuration: Double {
-        records.compactMap { Double($0.flight.dt) }.max() ?? 1
     }
 
     private var totalHours: Double {
@@ -106,10 +104,14 @@ struct ContentView: View {
                         .filter { !existing.contains($0.lastPathComponent) }
                         .map { url -> FlightRecord in
                             let ft = GarminExtractor.extract(from: url)
+                            let dep = nearestFor(ft.firstCoordinate)
+                            let arr = nearestFor(ft.lastCoordinate)
                             return FlightRecord(
                                 flight: ft,
-                                departure: airportFor(ft.firstCoordinate),
-                                arrival:   airportFor(ft.lastCoordinate)
+                                departure: dep?.airport,
+                                arrival:   arr?.airport,
+                                departureDistanceKm: dep?.distanceKilometers,
+                                arrivalDistanceKm:   arr?.distanceKilometers
                             )
                         }
                     withAnimation { records.append(contentsOf: new) }
@@ -130,12 +132,15 @@ struct ContentView: View {
                       let loaded = try? AirportBinaryReader.loadFromBundle()
                 else { return }
                 airports = loaded
-                // Backfill any records imported before airports finished loading
                 records = records.map {
-                    FlightRecord(
+                    let dep = nearestFor($0.flight.firstCoordinate)
+                    let arr = nearestFor($0.flight.lastCoordinate)
+                    return FlightRecord(
                         flight: $0.flight,
-                        departure: airportFor($0.flight.firstCoordinate),
-                        arrival:   airportFor($0.flight.lastCoordinate)
+                        departure: dep?.airport,
+                        arrival:   arr?.airport,
+                        departureDistanceKm: dep?.distanceKilometers,
+                        arrivalDistanceKm:   arr?.distanceKilometers
                     )
                 }
             }
@@ -144,13 +149,13 @@ struct ContentView: View {
 
     // MARK: - Helpers
 
-    private func airportFor(_ coord: Coordinate?) -> AirportRecord? {
+    private func nearestFor(_ coord: Coordinate?) -> AirportSearchResult? {
         guard let coord, !airports.isEmpty else { return nil }
         return nearestAirport(
             latitudeDegrees: coord.latitude,
             longitudeDegrees: coord.longitude,
             airports: airports
-        )?.airport
+        )
     }
 
     private func sortIcon(for order: FlightSortOrder) -> String {
@@ -196,7 +201,7 @@ struct ContentView: View {
         List {
             Section {
                 ForEach(sorted) { record in
-                    FlightRow(record: record, maxDuration: maxDuration)
+                    FlightRow(record: record)
                 }
                 .onDelete { indexSet in
                     let items = sorted
@@ -224,9 +229,9 @@ struct ContentView: View {
 
 struct FlightRow: View {
     let record: FlightRecord
-    let maxDuration: Double
 
     private var flight: FlightTime { record.flight }
+    private var isParsed: Bool { flight.onDutyEpoch > 0 }
 
     private var displayName: String {
         var n = flight.fileName
@@ -234,74 +239,126 @@ struct FlightRow: View {
         return n
     }
 
-    private var timeRange: String {
-        guard flight.start != "N/A" else { return "Could not parse file" }
-        let s = flight.start, e = flight.end
-        let sd = String(s.prefix(10)), ed = String(e.prefix(10))
-        let st = s.count >= 16 ? String(s.dropFirst(11).prefix(5)) : ""
-        let et = e.count >= 16 ? String(e.dropFirst(11).prefix(5)) : ""
-        return sd == ed
-            ? "\(sd)  \(st)–\(et) UTC"
-            : "\(String(s.prefix(16)))–\(String(e.prefix(16))) UTC"
-    }
-
-    private var isParsed: Bool { flight.start != "N/A" && !flight.dt.isEmpty }
-
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 3) {
+            // Filename + Hobbs
+            HStack(alignment: .firstTextBaseline) {
                 Text(displayName)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-
-                routeLabel
-
-                Text(timeRange)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 8)
+                if isParsed {
+                    VStack(alignment: .trailing, spacing: 0) {
+                        HStack(alignment: .lastTextBaseline, spacing: 2) {
+                            Text(flight.dt)
+                                .font(.title3.weight(.semibold).monospacedDigit())
+                                .foregroundStyle(.tint)
+                            Text("h")
+                                .font(.footnote.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Hobbs")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                } else {
+                    Text("—")
+                        .font(.title3.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             }
-
-            Spacer(minLength: 8)
 
             if isParsed {
-                HStack(alignment: .lastTextBaseline, spacing: 2) {
-                    Text(flight.dt)
-                        .font(.title3.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(.tint)
-                    Text("h")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.secondary)
+                routeLabel
+                Text(flight.date)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                timeRow("Hobbs",  flight.onDuty,  flight.offDuty)
+                if flight.timeOutEpoch > 0 || flight.timeInEpoch > 0 {
+                    timeRow("Engine", flight.timeOut, flight.timeIn)
+                } else {
+                    debugRow("Engine", engineDebug)
+                }
+                if flight.timeOffEpoch > 0 || flight.timeOnEpoch > 0 {
+                    timeRow("Flight", flight.timeOff, flight.timeOn)
+                } else {
+                    debugRow("Flight", flightDebug)
                 }
             } else {
-                Text("—")
-                    .font(.title3.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                Text("Could not parse file")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Debug strings
+
+    private var engineDebug: String {
+        let f = flight
+        if f.dbgFfCount == 0 { return "no FFlow data" }
+        return String(format: "n=%d maxFF=%.2f gph (need >5)", f.dbgFfCount, f.dbgFfMax)
+    }
+
+    private var flightDebug: String {
+        let f = flight
+        if f.dbgMaxTas == 0 { return "no TAS data" }
+        return String(format: "maxTAS=%.0f kt (need >60)", f.dbgMaxTas)
+    }
+
+    // MARK: - Row helpers
+
+    private func timeRow(_ label: String, _ start: String, _ end: String) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .frame(width: 48, alignment: .leading)
+                .foregroundStyle(.secondary)
+            Text(start)
+                .monospacedDigit()
+            Text("→")
+                .foregroundStyle(.tertiary)
+            Text(end)
+                .monospacedDigit()
+            Text("UTC")
+                .foregroundStyle(.tertiary)
+        }
+        .font(.caption)
+    }
+
+    private func debugRow(_ label: String, _ info: String) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            Text(label)
+                .frame(width: 48, alignment: .leading)
+                .foregroundStyle(.secondary)
+            Text(info)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.caption.monospacedDigit())
     }
 
     @ViewBuilder
     private var routeLabel: some View {
         if let dep = record.departure, let arr = record.arrival {
-            if dep.identifier == arr.identifier {
+            HStack(spacing: 4) {
                 Text(dep.identifier)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tint)
-            } else {
-                HStack(spacing: 4) {
-                    Text(dep.identifier)
-                    Image(systemName: "arrow.right")
-                        .imageScale(.small)
+                if let d = record.departureDistanceKm {
+                    Text(String(format: "%.1fkm", d))
                         .foregroundStyle(.tertiary)
-                    Text(arr.identifier)
                 }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.tint)
+                Image(systemName: "arrow.right")
+                    .imageScale(.small)
+                    .foregroundStyle(.tertiary)
+                Text(arr.identifier)
+                if let d = record.arrivalDistanceKm {
+                    Text(String(format: "%.1fkm", d))
+                        .foregroundStyle(.tertiary)
+                }
             }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.tint)
         }
     }
 }
@@ -319,34 +376,65 @@ struct FlightRow: View {
 private struct FlightListPreview: View {
     @State private var records: [FlightRecord] = [
         FlightRecord(
-            flight: FlightTime(fileName: "log_2025-03-17.csv",
-                               start: "2025-03-17 14:59:11", end: "2025-03-17 16:42:08",
-                               dt: "1.7", firstCoordinate: nil, lastCoordinate: nil),
-            departure: nil, arrival: nil
+            flight: FlightTime(
+                fileName: "log_2025-03-17.csv",
+                onDutyEpoch: 1742220000, offDutyEpoch: 1742226120,
+                timeOutEpoch: 1742220300, timeInEpoch: 1742225900,
+                timeOffEpoch: 1742220600, timeOnEpoch: 1742225700,
+                onDuty: "14:59", offDuty: "16:42",
+                timeOut: "15:04", timeIn: "16:38",
+                timeOff: "15:09", timeOn: "16:35",
+                date: "2025-03-17",
+                dt: "1.7",
+                firstCoordinate: nil, lastCoordinate: nil,
+                dbgMaxTas: 145, dbgFfCount: 45, dbgFfMax: 18.3
+            ),
+            departure: nil, arrival: nil,
+            departureDistanceKm: 1.2, arrivalDistanceKm: 0.8
         ),
         FlightRecord(
-            flight: FlightTime(fileName: "log_2025-03-22.csv",
-                               start: "2025-03-22 13:10:00", end: "2025-03-22 16:25:00",
-                               dt: "3.2", firstCoordinate: nil, lastCoordinate: nil),
-            departure: nil, arrival: nil
+            flight: FlightTime(
+                fileName: "log_2025-03-22.csv",
+                onDutyEpoch: 1742642400, offDutyEpoch: 1742654100,
+                timeOutEpoch: 0, timeInEpoch: 0,
+                timeOffEpoch: 0, timeOnEpoch: 0,
+                onDuty: "13:10", offDuty: "16:25",
+                timeOut: "—", timeIn: "—",
+                timeOff: "—", timeOn: "—",
+                date: "2025-03-22",
+                dt: "3.2",
+                firstCoordinate: nil, lastCoordinate: nil,
+                dbgMaxTas: 34, dbgFfCount: 12, dbgFfMax: 0.18
+            ),
+            departure: nil, arrival: nil,
+            departureDistanceKm: nil, arrivalDistanceKm: nil
         ),
         FlightRecord(
-            flight: FlightTime(fileName: "corrupted_file.csv",
-                               start: "N/A", end: "N/A",
-                               dt: "", firstCoordinate: nil, lastCoordinate: nil),
-            departure: nil, arrival: nil
+            flight: FlightTime(
+                fileName: "corrupted_file.csv",
+                onDutyEpoch: 0, offDutyEpoch: 0,
+                timeOutEpoch: 0, timeInEpoch: 0,
+                timeOffEpoch: 0, timeOnEpoch: 0,
+                onDuty: "—", offDuty: "—",
+                timeOut: "—", timeIn: "—",
+                timeOff: "—", timeOn: "—",
+                date: "—", dt: "",
+                firstCoordinate: nil, lastCoordinate: nil,
+                dbgMaxTas: 0, dbgFfCount: 0, dbgFfMax: 0
+            ),
+            departure: nil, arrival: nil,
+            departureDistanceKm: nil, arrivalDistanceKm: nil
         ),
     ]
 
-    private var maxDuration: Double { records.compactMap { Double($0.flight.dt) }.max() ?? 1 }
-    private var totalHours: Double  { records.compactMap { Double($0.flight.dt) }.reduce(0, +) }
+    private var totalHours: Double { records.compactMap { Double($0.flight.dt) }.reduce(0, +) }
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    ForEach(records) { FlightRow(record: $0, maxDuration: maxDuration) }
-                    .onDelete { records.remove(atOffsets: $0) }
+                    ForEach(records) { FlightRow(record: $0) }
+                        .onDelete { records.remove(atOffsets: $0) }
                 }
                 Section {
                     HStack {

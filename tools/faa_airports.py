@@ -23,9 +23,9 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-
-BASE_URL = "https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/"
-
+BASE_URL = (
+    "https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/"
+)
 DEFAULT_BINARY_FILE = Path("faa_airports.bin")
 
 BINARY_MAGIC = b"FAAPT001"
@@ -37,12 +37,12 @@ REQUIRED_COLUMNS = [
     "ICAO_ID",
     "LAT_DECIMAL",
     "LONG_DECIMAL",
+    "SITE_TYPE_CODE",
 ]
 
 MAX_REASONABLE_AIRPORTS = 100_000
 UNIT_VECTOR_TOLERANCE = 1.0e-12
-RADIAN_TOLERANCE = 1.0e-12
-
+EARTH_RADIUS_NM = 3440.065
 VERBOSE = False
 
 
@@ -64,19 +64,11 @@ class AirportRecord:
 
     @classmethod
     def from_lat_lon(
-        cls,
-        identifier: str,
-        latitude_degrees: float,
-        longitude_degrees: float,
+        cls, identifier: str, latitude_degrees: float, longitude_degrees: float
     ) -> AirportRecord:
         latitude_radians = math.radians(latitude_degrees)
         longitude_radians = math.radians(longitude_degrees)
-
         cos_latitude = math.cos(latitude_radians)
-
-        unit_x = cos_latitude * math.cos(longitude_radians)
-        unit_y = cos_latitude * math.sin(longitude_radians)
-        unit_z = math.sin(latitude_radians)
 
         airport = cls(
             identifier=identifier,
@@ -84,14 +76,32 @@ class AirportRecord:
             longitude_degrees=longitude_degrees,
             latitude_radians=latitude_radians,
             longitude_radians=longitude_radians,
-            unit_x=unit_x,
-            unit_y=unit_y,
-            unit_z=unit_z,
+            unit_x=cos_latitude * math.cos(longitude_radians),
+            unit_y=cos_latitude * math.sin(longitude_radians),
+            unit_z=math.sin(latitude_radians),
         )
 
         airport.validate()
-
         return airport
+
+    def distance_nm_to(
+        self, latitude_degrees: float, longitude_degrees: float
+    ) -> float:
+        latitude_radians = math.radians(latitude_degrees)
+        longitude_radians = math.radians(longitude_degrees)
+
+        delta_latitude = latitude_radians - self.latitude_radians
+        delta_longitude = longitude_radians - self.longitude_radians
+
+        a = (
+            math.sin(delta_latitude / 2.0) ** 2
+            + math.cos(self.latitude_radians)
+            * math.cos(latitude_radians)
+            * math.sin(delta_longitude / 2.0) ** 2
+        )
+
+        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+        return EARTH_RADIUS_NM * c
 
     def to_text_line(self) -> str:
         return (
@@ -106,32 +116,20 @@ class AirportRecord:
         )
 
     def validate(self, index: int | None = None) -> None:
-        prefix = "Airport record"
-        if index is not None:
-            prefix = f"Airport record {index}"
+        prefix = "Airport record" if index is None else f"Airport record {index}"
 
         if not self.identifier:
             raise RuntimeError(f"{prefix}: empty identifier")
 
-        if len(self.identifier.encode("ascii", errors="ignore")) != len(self.identifier):
-            raise RuntimeError(f"{prefix}: identifier is not ASCII: {self.identifier!r}")
+        if len(self.identifier.encode("ascii", errors="ignore")) != len(
+            self.identifier
+        ):
+            raise RuntimeError(
+                f"{prefix}: identifier is not ASCII: {self.identifier!r}"
+            )
 
         if len(self.identifier.encode("ascii")) > 8:
             raise RuntimeError(f"{prefix}: identifier too long: {self.identifier!r}")
-
-        for character in self.identifier:
-            if not (character.isalnum() or character in {"_", "-"}):
-                raise RuntimeError(
-                    f"{prefix}: suspicious identifier {self.identifier!r}"
-                )
-
-        validate_finite(prefix, "latitude_degrees", self.latitude_degrees)
-        validate_finite(prefix, "longitude_degrees", self.longitude_degrees)
-        validate_finite(prefix, "latitude_radians", self.latitude_radians)
-        validate_finite(prefix, "longitude_radians", self.longitude_radians)
-        validate_finite(prefix, "unit_x", self.unit_x)
-        validate_finite(prefix, "unit_y", self.unit_y)
-        validate_finite(prefix, "unit_z", self.unit_z)
 
         if not -90.0 <= self.latitude_degrees <= 90.0:
             raise RuntimeError(
@@ -143,38 +141,17 @@ class AirportRecord:
                 f"{prefix}: longitude out of range: {self.longitude_degrees}"
             )
 
-        if not -math.pi / 2.0 <= self.latitude_radians <= math.pi / 2.0:
-            raise RuntimeError(
-                f"{prefix}: latitude_radians out of range: {self.latitude_radians}"
-            )
-
-        if not -math.pi <= self.longitude_radians <= math.pi:
-            raise RuntimeError(
-                f"{prefix}: longitude_radians out of range: {self.longitude_radians}"
-            )
-
-        expected_latitude_radians = math.radians(self.latitude_degrees)
-        expected_longitude_radians = math.radians(self.longitude_degrees)
-
-        if abs(self.latitude_radians - expected_latitude_radians) > RADIAN_TOLERANCE:
-            raise RuntimeError(
-                f"{prefix}: latitude_radians mismatch: "
-                f"stored={self.latitude_radians}, expected={expected_latitude_radians}"
-            )
-
-        if abs(self.longitude_radians - expected_longitude_radians) > RADIAN_TOLERANCE:
-            raise RuntimeError(
-                f"{prefix}: longitude_radians mismatch: "
-                f"stored={self.longitude_radians}, expected={expected_longitude_radians}"
-            )
-
         for name, value in [
+            ("latitude_degrees", self.latitude_degrees),
+            ("longitude_degrees", self.longitude_degrees),
+            ("latitude_radians", self.latitude_radians),
+            ("longitude_radians", self.longitude_radians),
             ("unit_x", self.unit_x),
             ("unit_y", self.unit_y),
             ("unit_z", self.unit_z),
         ]:
-            if not -1.0 <= value <= 1.0:
-                raise RuntimeError(f"{prefix}: {name} out of range: {value}")
+            if not math.isfinite(value):
+                raise RuntimeError(f"{prefix}: {name} is not finite: {value}")
 
         vector_length_squared = (
             self.unit_x * self.unit_x
@@ -184,53 +161,8 @@ class AirportRecord:
 
         if abs(vector_length_squared - 1.0) > UNIT_VECTOR_TOLERANCE:
             raise RuntimeError(
-                f"{prefix}: unit vector length mismatch: "
-                f"length_squared={vector_length_squared}"
+                f"{prefix}: unit vector length mismatch: {vector_length_squared}"
             )
-
-        expected = AirportRecord.from_lat_lon_without_validation(
-            self.identifier,
-            self.latitude_degrees,
-            self.longitude_degrees,
-        )
-
-        if abs(self.unit_x - expected.unit_x) > UNIT_VECTOR_TOLERANCE:
-            raise RuntimeError(
-                f"{prefix}: unit_x mismatch: stored={self.unit_x}, expected={expected.unit_x}"
-            )
-
-        if abs(self.unit_y - expected.unit_y) > UNIT_VECTOR_TOLERANCE:
-            raise RuntimeError(
-                f"{prefix}: unit_y mismatch: stored={self.unit_y}, expected={expected.unit_y}"
-            )
-
-        if abs(self.unit_z - expected.unit_z) > UNIT_VECTOR_TOLERANCE:
-            raise RuntimeError(
-                f"{prefix}: unit_z mismatch: stored={self.unit_z}, expected={expected.unit_z}"
-            )
-
-    @classmethod
-    def from_lat_lon_without_validation(
-        cls,
-        identifier: str,
-        latitude_degrees: float,
-        longitude_degrees: float,
-    ) -> AirportRecord:
-        latitude_radians = math.radians(latitude_degrees)
-        longitude_radians = math.radians(longitude_degrees)
-
-        cos_latitude = math.cos(latitude_radians)
-
-        return cls(
-            identifier=identifier,
-            latitude_degrees=latitude_degrees,
-            longitude_degrees=longitude_degrees,
-            latitude_radians=latitude_radians,
-            longitude_radians=longitude_radians,
-            unit_x=cos_latitude * math.cos(longitude_radians),
-            unit_y=cos_latitude * math.sin(longitude_radians),
-            unit_z=math.sin(latitude_radians),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,18 +178,8 @@ class AirportDatabase:
         log(f"APT CSV URL: {apt_csv_url}")
 
         airports = download_airports(apt_csv_url)
-
         database = cls(tuple(airports))
         database.verify()
-
-        return database
-
-    @classmethod
-    def from_csv_bytes(cls, csv_bytes: bytes) -> AirportDatabase:
-        airports = parse_airports_from_csv_bytes(csv_bytes)
-        database = cls(tuple(airports))
-        database.verify()
-
         return database
 
     @classmethod
@@ -276,11 +198,6 @@ class AirportDatabase:
                 f"Bad binary magic: expected {BINARY_MAGIC!r}, got {magic!r}"
             )
 
-        if count > MAX_REASONABLE_AIRPORTS:
-            raise RuntimeError(
-                f"Airport count is suspiciously large: {count}"
-            )
-
         expected_size = BINARY_HEADER_STRUCT.size + count * BINARY_RECORD_STRUCT.size
 
         if len(data) != expected_size:
@@ -292,28 +209,23 @@ class AirportDatabase:
         offset = BINARY_HEADER_STRUCT.size
 
         for index in range(count):
-            try:
-                (
-                    identifier_bytes,
-                    latitude_degrees,
-                    longitude_degrees,
-                    latitude_radians,
-                    longitude_radians,
-                    unit_x,
-                    unit_y,
-                    unit_z,
-                ) = BINARY_RECORD_STRUCT.unpack_from(data, offset)
-            except struct.error as error:
-                raise RuntimeError(f"Could not unpack airport record {index}") from error
-
-            identifier = decode_identifier(identifier_bytes)
+            (
+                identifier_bytes,
+                lat_deg,
+                lon_deg,
+                lat_rad,
+                lon_rad,
+                unit_x,
+                unit_y,
+                unit_z,
+            ) = BINARY_RECORD_STRUCT.unpack_from(data, offset)
 
             airport = AirportRecord(
-                identifier=identifier,
-                latitude_degrees=latitude_degrees,
-                longitude_degrees=longitude_degrees,
-                latitude_radians=latitude_radians,
-                longitude_radians=longitude_radians,
+                identifier=decode_identifier(identifier_bytes),
+                latitude_degrees=lat_deg,
+                longitude_degrees=lon_deg,
+                latitude_radians=lat_rad,
+                longitude_radians=lon_rad,
                 unit_x=unit_x,
                 unit_y=unit_y,
                 unit_z=unit_z,
@@ -358,20 +270,29 @@ class AirportDatabase:
         path.write_bytes(self.to_binary_bytes())
 
     def write_text(self, file: TextIO) -> None:
-        file.write(
-            "IDENT "
-            "LAT_DEG "
-            "LON_DEG "
-            "LAT_RAD "
-            "LON_RAD "
-            "UNIT_X "
-            "UNIT_Y "
-            "UNIT_Z\n"
-        )
+        file.write("IDENT LAT_DEG LON_DEG LAT_RAD LON_RAD UNIT_X UNIT_Y UNIT_Z\n")
 
         for airport in self.airports:
             file.write(airport.to_text_line())
             file.write("\n")
+
+    def nearest_airport(
+        self, latitude_degrees: float, longitude_degrees: float
+    ) -> tuple[AirportRecord, float]:
+        best_airport: AirportRecord | None = None
+        best_distance = math.inf
+
+        for airport in self.airports:
+            distance = airport.distance_nm_to(latitude_degrees, longitude_degrees)
+
+            if distance < best_distance:
+                best_airport = airport
+                best_distance = distance
+
+        if best_airport is None:
+            raise RuntimeError("Airport database is empty")
+
+        return best_airport, best_distance
 
     def verify(self) -> None:
         if not self.airports:
@@ -382,36 +303,27 @@ class AirportDatabase:
                 f"Airport database is suspiciously large: {len(self.airports)}"
             )
 
-        seen_identifiers: set[str] = set()
+        seen: set[str] = set()
 
         for index, airport in enumerate(self.airports):
             airport.validate(index)
 
-            key = airport.identifier
+            if airport.identifier in seen:
+                raise RuntimeError(
+                    f"Duplicate airport identifier: {airport.identifier}"
+                )
 
-            if key in seen_identifiers:
-                raise RuntimeError(f"Duplicate airport identifier: {key}")
-
-            seen_identifiers.add(key)
+            seen.add(airport.identifier)
 
     def verify_binary_round_trip(self) -> None:
-        data = self.to_binary_bytes()
-        parsed = AirportDatabase.from_binary_bytes(data)
+        parsed = AirportDatabase.from_binary_bytes(self.to_binary_bytes())
 
         if parsed != self:
             raise RuntimeError("Binary round-trip verification failed")
 
 
-def validate_finite(prefix: str, name: str, value: float) -> None:
-    if not math.isfinite(value):
-        raise RuntimeError(f"{prefix}: {name} is not finite: {value}")
-
-
 def clean_cell(value: str | None) -> str:
-    if value is None:
-        return ""
-
-    return value.strip()
+    return "" if value is None else value.strip()
 
 
 def normalize_header(value: str) -> str:
@@ -422,7 +334,9 @@ def encode_identifier(identifier: str) -> bytes:
     encoded = identifier.encode("ascii")
 
     if len(encoded) > 8:
-        raise ValueError(f"Airport identifier too long for binary format: {identifier!r}")
+        raise ValueError(
+            f"Airport identifier too long for binary format: {identifier!r}"
+        )
 
     return encoded.ljust(8, b"\0")
 
@@ -441,7 +355,6 @@ def get_current_subscription_url() -> str:
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
-
     current = soup.find(string=lambda text: text is not None and "Current" in text)
 
     if current is None:
@@ -467,35 +380,49 @@ def get_apt_csv_url(subscription_url: str) -> str:
     soup = BeautifulSoup(response.text, "html.parser")
 
     for link in soup.find_all("a", href=True):
-        text = link.get_text(strip=True)
-
-        if "Airports and Other Landing Facilities" in text:
+        if "Airports and Other Landing Facilities" in link.get_text(strip=True):
             return urljoin(subscription_url, link["href"])
 
-    raise RuntimeError("Could not find Airports and Other Landing Facilities CSV ZIP URL")
+    raise RuntimeError(
+        "Could not find Airports and Other Landing Facilities CSV ZIP URL"
+    )
 
 
 def find_apt_base_csv_name(zip_file: zipfile.ZipFile) -> str:
-    names = zip_file.namelist()
-
-    for name in names:
+    for name in zip_file.namelist():
         if name.upper().endswith("APT_BASE.CSV"):
             return name
 
-    raise RuntimeError(f"APT_BASE.csv not found. ZIP contains: {names}")
+    raise RuntimeError(f"APT_BASE.csv not found. ZIP contains: {zip_file.namelist()}")
+
+
+def make_csv_reader(csv_bytes: bytes) -> csv.DictReader[str]:
+    text_file = io.TextIOWrapper(
+        io.BytesIO(csv_bytes), encoding="utf-8-sig", newline=""
+    )
+
+    reader = csv.DictReader(
+        text_file,
+        delimiter=",",
+        quotechar='"',
+        doublequote=True,
+        skipinitialspace=False,
+    )
+
+    if reader.fieldnames is None:
+        raise RuntimeError("APT_BASE.csv has no header row")
+
+    reader.fieldnames = [normalize_header(fieldname) for fieldname in reader.fieldnames]
+
+    return reader
 
 
 def require_columns(fieldnames: list[str], required_columns: list[str]) -> None:
-    missing = [
-        column
-        for column in required_columns
-        if column not in fieldnames
-    ]
+    missing = [column for column in required_columns if column not in fieldnames]
 
     if missing:
         raise RuntimeError(
-            f"Missing required CSV columns: {missing}. "
-            f"Available columns: {fieldnames}"
+            f"Missing required CSV columns: {missing}. Available columns: {fieldnames}"
         )
 
 
@@ -505,12 +432,7 @@ def parse_float_cell(row: dict[str, str], column_name: str, row_number: int) -> 
     if not value:
         raise ValueError(f"Missing {column_name} on CSV row {row_number}")
 
-    try:
-        return float(value)
-    except ValueError as error:
-        raise ValueError(
-            f"Bad float in column {column_name} on CSV row {row_number}: {value!r}"
-        ) from error
+    return float(value)
 
 
 def get_airport_identifier(row: dict[str, str]) -> str:
@@ -522,10 +444,12 @@ def get_airport_identifier(row: dict[str, str]) -> str:
     return clean_cell(row.get("ARPT_ID"))
 
 
-def parse_airport_row(
-    row: dict[str, str],
-    row_number: int,
-) -> AirportRecord | None:
+def parse_airport_row(row: dict[str, str], row_number: int) -> AirportRecord | None:
+    site_type_code = clean_cell(row.get("SITE_TYPE_CODE")).upper()
+
+    if site_type_code != "A":
+        return None
+
     airport_id = get_airport_identifier(row)
 
     if not airport_id:
@@ -541,32 +465,6 @@ def parse_airport_row(
     )
 
 
-def make_csv_reader(csv_bytes: bytes) -> csv.DictReader[str]:
-    text_file = io.TextIOWrapper(
-        io.BytesIO(csv_bytes),
-        encoding="utf-8-sig",
-        newline="",
-    )
-
-    reader = csv.DictReader(
-        text_file,
-        delimiter=",",
-        quotechar='"',
-        doublequote=True,
-        skipinitialspace=False,
-    )
-
-    if reader.fieldnames is None:
-        raise RuntimeError("APT_BASE.csv has no header row")
-
-    reader.fieldnames = [
-        normalize_header(fieldname)
-        for fieldname in reader.fieldnames
-    ]
-
-    return reader
-
-
 def parse_airports_from_csv_bytes(csv_bytes: bytes) -> list[AirportRecord]:
     reader = make_csv_reader(csv_bytes)
 
@@ -575,12 +473,8 @@ def parse_airports_from_csv_bytes(csv_bytes: bytes) -> list[AirportRecord]:
 
     require_columns(reader.fieldnames, REQUIRED_COLUMNS)
 
-    log(f"CSV columns: {len(reader.fieldnames)}")
-    log("Using identifier: ICAO_ID if available, otherwise ARPT_ID")
-    log("Using coordinates: LAT_DECIMAL, LONG_DECIMAL")
-
     airports: list[AirportRecord] = []
-
+    skipped_not_airport = 0
     skipped_missing = 0
     skipped_bad_number = 0
     skipped_malformed = 0
@@ -602,7 +496,10 @@ def parse_airports_from_csv_bytes(csv_bytes: bytes) -> list[AirportRecord]:
             airport = parse_airport_row(clean_row, row_number)
 
             if airport is None:
-                skipped_missing += 1
+                if clean_cell(clean_row.get("SITE_TYPE_CODE")).upper() != "A":
+                    skipped_not_airport += 1
+                else:
+                    skipped_missing += 1
                 continue
 
             if clean_cell(clean_row.get("ICAO_ID")):
@@ -619,6 +516,7 @@ def parse_airports_from_csv_bytes(csv_bytes: bytes) -> list[AirportRecord]:
     log(f"Parsed airports: {len(airports)}")
     log(f"Used ICAO_ID: {used_icao_id}")
     log(f"Used ARPT_ID fallback: {used_arpt_id}")
+    log(f"Skipped non-airport site types: {skipped_not_airport}")
     log(f"Skipped rows with missing airport id: {skipped_missing}")
     log(f"Skipped rows with bad numbers: {skipped_bad_number}")
     log(f"Skipped malformed CSV rows: {skipped_malformed}")
@@ -648,69 +546,57 @@ def download_airports(csv_zip_url: str) -> list[AirportRecord]:
     return parse_airports_from_csv_bytes(csv_bytes)
 
 
+def parse_lat_lon(value: str) -> tuple[float, float]:
+    try:
+        lat_text, lon_text = value.split(",", 1)
+        return float(lat_text), float(lon_text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"Expected lat,lon but got {value!r}"
+        ) from error
+
+
 def print_summary(database: AirportDatabase, path: Path | None = None) -> None:
     if path is not None:
         log(f"Binary airport file: {path}")
         log(f"Binary size: {path.stat().st_size:,} bytes")
 
     log(f"Airports: {len(database.airports)}")
-    log()
-    log("Binary format:")
-    log("magic: 8 bytes, ASCII FAAPT001")
-    log("count: UInt32 little-endian")
-    log("record: ident[8] + 7 little-endian doubles")
-    log("record size: 64 bytes")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download, write, read, and inspect FAA airport binary data."
+        description="Download FAA AIRPORT-only data and query nearest airports."
     )
 
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print progress and summary information to stderr.",
+        "-v", "--verbose", action="store_true", help="Print progress to stderr."
     )
 
     subparsers = parser.add_subparsers(dest="command")
 
     download_parser = subparsers.add_parser(
-        "download",
-        help="Download current FAA airport data and write the binary file.",
+        "download", help="Download current FAA AIRPORT-only data."
     )
     download_parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        default=DEFAULT_BINARY_FILE,
-        help=f"Output binary file. Default: {DEFAULT_BINARY_FILE}",
+        "-o", "--output", type=Path, default=DEFAULT_BINARY_FILE
     )
 
     dump_parser = subparsers.add_parser(
-        "dump",
-        help="Read a binary airport file and write text rows to stdout.",
+        "dump", help="Dump binary airport file to stdout."
     )
-    dump_parser.add_argument(
-        "input",
-        nargs="?",
-        type=Path,
-        default=DEFAULT_BINARY_FILE,
-        help=f"Input binary file. Default: {DEFAULT_BINARY_FILE}",
+    dump_parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_BINARY_FILE)
+
+    verify_parser = subparsers.add_parser("verify", help="Verify binary airport file.")
+    verify_parser.add_argument(
+        "input", nargs="?", type=Path, default=DEFAULT_BINARY_FILE
     )
 
-    verify_parser = subparsers.add_parser(
-        "verify",
-        help="Read a binary airport file and verify that it can round-trip.",
+    nearest_parser = subparsers.add_parser(
+        "nearest", help="Find nearest AIRPORT for lat,lon pair(s)."
     )
-    verify_parser.add_argument(
-        "input",
-        nargs="?",
-        type=Path,
-        default=DEFAULT_BINARY_FILE,
-        help=f"Input binary file. Default: {DEFAULT_BINARY_FILE}",
-    )
+    nearest_parser.add_argument("-d", "--db", type=Path, default=DEFAULT_BINARY_FILE)
+    nearest_parser.add_argument("pairs", nargs="+", type=parse_lat_lon)
 
     args = parser.parse_args()
 
@@ -724,7 +610,7 @@ def parse_args() -> argparse.Namespace:
 def run_download(output_path: Path) -> None:
     log("Finding current NASR subscription...")
     log("Finding APT CSV ZIP...")
-    log("Downloading and parsing airport CSV...")
+    log("Downloading and parsing AIRPORT-only rows...")
 
     database = AirportDatabase.from_download()
     database.verify_binary_round_trip()
@@ -747,6 +633,19 @@ def run_verify(input_path: Path) -> None:
     print_summary(database, input_path)
 
 
+def run_nearest(db_path: Path, pairs: list[tuple[float, float]]) -> None:
+    database = AirportDatabase.from_binary_file(db_path)
+
+    for latitude, longitude in pairs:
+        airport, distance_nm = database.nearest_airport(latitude, longitude)
+        print(
+            f"{latitude:.10f},{longitude:.10f} "
+            f"{airport.identifier} "
+            f"{distance_nm:.2f}nm "
+            f"{airport.latitude_degrees:.10f},{airport.longitude_degrees:.10f}"
+        )
+
+
 def main() -> None:
     global VERBOSE
 
@@ -755,17 +654,14 @@ def main() -> None:
 
     if args.command == "download":
         run_download(args.output)
-        return
-
-    if args.command == "dump":
+    elif args.command == "dump":
         run_dump(args.input)
-        return
-
-    if args.command == "verify":
+    elif args.command == "verify":
         run_verify(args.input)
-        return
-
-    raise RuntimeError(f"Unknown command: {args.command}")
+    elif args.command == "nearest":
+        run_nearest(args.db, args.pairs)
+    else:
+        raise RuntimeError(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":

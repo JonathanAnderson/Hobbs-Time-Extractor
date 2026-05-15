@@ -14,12 +14,12 @@ public struct Coordinate: Hashable {
     public let longitude: Double
 }
 
-/// One data row yielded by GarminTimeReader.
 public struct GarminRow {
     public let epochSec: Int
-    /// Latitude in decimal degrees, present only when GPSfix=="3DDiff", HPLwas<100, VPLwas<100.
     public let latitude: Double?
     public let longitude: Double?
+    public let tas: Double?       // True Airspeed (kt)
+    public let maxFFlow: Double?  // max fuel flow across all FFlow columns (gph)
 }
 
 // MARK: - GarminTimeReader
@@ -41,6 +41,8 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
         let gpsFix: Int
         let hplWas: Int
         let vplWas: Int
+        let tas: Int?
+        let fflows: [Int]
     }
 
     public init?(url: URL, bufferSize: Int = 4_096) {
@@ -84,9 +86,14 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
                 }
 
                 let epochSec = parser.parse(buffer)
-                let gps = colIndices.flatMap { parseGPS(line, indices: $0) }
+                let gps    = colIndices.flatMap { parseGPS(line, indices: $0) }
+                let motion = colIndices.flatMap { parseMotion(line, indices: $0) }
                 buffer.removeSubrange(0..<range.upperBound)
-                return GarminRow(epochSec: epochSec, latitude: gps?.lat, longitude: gps?.lon)
+                return GarminRow(
+                    epochSec: epochSec,
+                    latitude: gps?.lat, longitude: gps?.lon,
+                    tas: motion?.tas, maxFFlow: motion?.maxFFlow
+                )
             } else {
                 guard let chunk = try? fileHandle.read(upToCount: bufferSize),
                       !chunk.isEmpty else { return nil }
@@ -98,13 +105,19 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
     private func parseColumnIndices(_ line: Data) -> ColumnIndices? {
         guard let s = String(data: line, encoding: .ascii) else { return nil }
         var map: [String: Int] = [:]
+        var fflowIndices: [Int] = []
         for (i, col) in s.split(separator: ",", omittingEmptySubsequences: false).enumerated() {
-            map[col.trimmingCharacters(in: .whitespaces)] = i
+            let name = col.trimmingCharacters(in: .whitespaces)
+            map[name] = i
+            if name.contains("FFlow") { fflowIndices.append(i) }
         }
         guard let lat = map["Latitude"], let lon = map["Longitude"],
-              let fix = map["GPSfix"],  let hpl = map["HPLwas"], let vpl = map["VPLwas"]
+              let fix = map["GPSfix"], let hpl = map["HPLwas"], let vpl = map["VPLwas"]
         else { return nil }
-        return ColumnIndices(latitude: lat, longitude: lon, gpsFix: fix, hplWas: hpl, vplWas: vpl)
+        return ColumnIndices(
+            latitude: lat, longitude: lon, gpsFix: fix, hplWas: hpl, vplWas: vpl,
+            tas: map["TAS"], fflows: fflowIndices
+        )
     }
 
     private func parseGPS(_ line: Data, indices: ColumnIndices) -> (lat: Double, lon: Double)? {
@@ -123,6 +136,21 @@ public class GarminTimeReader: Sequence, IteratorProtocol {
         guard !latStr.isEmpty, !lonStr.isEmpty,
               let lat = Double(latStr), let lon = Double(lonStr) else { return nil }
         return (lat, lon)
+    }
+
+    private func parseMotion(
+        _ line: Data, indices: ColumnIndices
+    ) -> (tas: Double?, maxFFlow: Double?)? {
+        guard indices.tas != nil || !indices.fflows.isEmpty else { return nil }
+        guard let s = String(data: line, encoding: .ascii) else { return nil }
+        let cols = s.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        func get(_ idx: Int?) -> Double? {
+            guard let idx, cols.count > idx else { return nil }
+            return Double(cols[idx])
+        }
+        let maxFF = indices.fflows.isEmpty ? nil : indices.fflows.compactMap { get($0) }.max()
+        return (tas: get(indices.tas), maxFFlow: maxFF)
     }
 }
 
@@ -175,8 +203,6 @@ public struct GarminTimestampParser {
         return dayEpoch + timeSec - tzOffsetSec
     }
 
-    // Proleptic Gregorian calendar → days since Unix epoch.
-    // Uses integer arithmetic only; avoids Calendar overhead in the hot path.
     private func epochDay(yyyy: Int32, mm: Int32, dd: Int32) -> Int {
         var y = yyyy
         var m = mm
@@ -191,60 +217,158 @@ public struct GarminTimestampParser {
 /// Immutable result for one CSV file.
 public struct FlightTime {
     public let fileName: String
-    public let start: String
-    public let end: String
+    // UTC epoch seconds (0 = not detected)
+    public let onDutyEpoch:  Int
+    public let offDutyEpoch: Int
+    public let timeOutEpoch: Int
+    public let timeInEpoch:  Int
+    public let timeOffEpoch: Int
+    public let timeOnEpoch:  Int
+    // Formatted "HH:mm" UTC display strings ("—" if not detected)
+    public let onDuty:  String
+    public let offDuty: String
+    public let timeOut: String
+    public let timeIn:  String
+    public let timeOff: String
+    public let timeOn:  String
+    // "yyyy-MM-dd" UTC date of the On Duty event
+    public let date: String
+    // Hobbs = (offDuty − onDuty) / 3600, formatted "H.h"
     public let dt: String
-    /// First GPS fix meeting quality criteria (GPSfix==3DDiff, HPL<100, VPL<100).
+    /// First GPS fix meeting quality criteria.
     public let firstCoordinate: Coordinate?
     /// Last GPS fix meeting quality criteria.
     public let lastCoordinate: Coordinate?
+    // Debug: always populated, helps diagnose missed detections
+    public let dbgMaxTas:  Double   // highest TAS seen in file (need >60 for flight)
+    public let dbgFfCount: Int      // data points with FFlow seen
+    public let dbgFfMax:   Double   // highest fuel flow seen (need >5 for engine)
 }
 
 // MARK: - GarminExtractor
 
-/// All parsing logic lives here; UI just calls extract(from:).
 public enum GarminExtractor {
-    private static let df: DateFormatter = {
+    private static let timeFmt: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        f.dateFormat = "HH:mm"
         f.locale     = Locale(identifier: "en_US_POSIX")
         f.timeZone   = TimeZone(secondsFromGMT: 0)
         return f
     }()
 
-    public static func extract(from url: URL) -> FlightTime {
-        let hasAccess = url.startAccessingSecurityScopedResource()
-        defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale     = Locale(identifier: "en_US_POSIX")
+        f.timeZone   = TimeZone(secondsFromGMT: 0)
+        return f
+    }()
 
-        guard let reader = GarminTimeReader(url: url) else {
-            return FlightTime(fileName: url.lastPathComponent,
-                              start: "N/A", end: "N/A", dt: "",
-                              firstCoordinate: nil, lastCoordinate: nil)
+    private static func fmt(_ epoch: Int) -> String {
+        guard epoch > 0 else { return "—" }
+        return timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+    }
+
+    private static func fmtDate(_ epoch: Int) -> String {
+        guard epoch > 0 else { return "—" }
+        return dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+    }
+
+    public static func extract(from url: URL) -> FlightTime {
+        func na() -> FlightTime {
+            FlightTime(
+                fileName: url.lastPathComponent,
+                onDutyEpoch: 0, offDutyEpoch: 0,
+                timeOutEpoch: 0, timeInEpoch: 0,
+                timeOffEpoch: 0, timeOnEpoch: 0,
+                onDuty: "—", offDuty: "—",
+                timeOut: "—", timeIn: "—",
+                timeOff: "—", timeOn: "—",
+                date: "—", dt: "",
+                firstCoordinate: nil, lastCoordinate: nil,
+                dbgMaxTas: 0, dbgFfCount: 0, dbgFfMax: 0
+            )
         }
 
-        var beg = 0, end = 0, missingCount = 0
+        guard let reader = GarminTimeReader(url: url) else { return na() }
+
+        // -- Duty --
+        var tOnDuty  = 0
+        var tOffDuty = 0
+
+        // -- GPS --
         var firstCoord: Coordinate? = nil
         var lastCoord:  Coordinate? = nil
 
+        // -- Engine detection: any engine running when max FFlow > 5 gph --
+        var ffCount = 0     // data points with FFlow present (debug)
+        var tOut    = 0     // first engine start
+        var tIn     = 0     // last engine stop (keeps updating)
+
+        // -- Takeoff / landing detection via TAS threshold --
+        var tOff = 0   // first time TAS > 60 kt
+        var tOn  = 0   // first time TAS < 40 kt after takeoff
+
+        // -- Debug accumulators --
+        var dbgMaxTas = 0.0
+        var dbgFfMax  = 0.0
+
         for row in reader {
-            guard row.epochSec > 24 * 3600 * 365 else { missingCount += 1; continue }
-            if beg == 0 {
-                beg = row.epochSec - missingCount
-                end = row.epochSec
-            } else if row.epochSec > end {
-                end = row.epochSec
-            }
+            guard row.epochSec > 24 * 3600 * 365 else { continue }
+            let t = row.epochSec
+
+            if tOnDuty == 0 { tOnDuty = t }
+            tOffDuty = t
+
+            // GPS
             if let lat = row.latitude, let lon = row.longitude {
                 if firstCoord == nil { firstCoord = Coordinate(latitude: lat, longitude: lon) }
                 lastCoord = Coordinate(latitude: lat, longitude: lon)
             }
+
+            // Engine detection: > 5 gph means at least one engine is running
+            if let ff = row.maxFFlow {
+                ffCount += 1
+                if ff > dbgFfMax { dbgFfMax = ff }
+                if tOut == 0 {
+                    if ff > 5.0 { tOut = t }
+                } else if ff <= 5.0 {
+                    tIn = t
+                }
+            }
+
+            // Takeoff / landing detection via TAS
+            // >60 kt → airborne; <40 kt after takeoff → landed
+            if let tas = row.tas {
+                if tas > dbgMaxTas { dbgMaxTas = tas }
+                if tOff == 0 && tas > 60.0 {
+                    tOff = t
+                } else if tOff > 0 && tOn == 0 && tas < 40.0 {
+                    tOn = t
+                }
+            }
         }
 
-        let begStr = df.string(from: Date(timeIntervalSince1970: TimeInterval(beg)))
-        let endStr = df.string(from: Date(timeIntervalSince1970: TimeInterval(end)))
-        let dtStr  = String(format: "%.1f", Double(end - beg) / 3600)
-        return FlightTime(fileName: url.lastPathComponent,
-                          start: begStr, end: endStr, dt: dtStr,
-                          firstCoordinate: firstCoord, lastCoordinate: lastCoord)
+        // End-of-file fallbacks
+        if tOff > 0 && tOn == 0 { tOn = tOffDuty }
+        if tOut > 0 && tIn == 0 { tIn = tOffDuty }
+
+        guard tOnDuty > 0 else { return na() }
+
+        let dtHours = tOffDuty > tOnDuty ? Double(tOffDuty - tOnDuty) / 3600.0 : 0.0
+
+        return FlightTime(
+            fileName: url.lastPathComponent,
+            onDutyEpoch: tOnDuty,   offDutyEpoch: tOffDuty,
+            timeOutEpoch: tOut,     timeInEpoch:  tIn,
+            timeOffEpoch: tOff,     timeOnEpoch:  tOn,
+            onDuty:  fmt(tOnDuty),  offDuty: fmt(tOffDuty),
+            timeOut: fmt(tOut),     timeIn:  fmt(tIn),
+            timeOff: fmt(tOff),     timeOn:  fmt(tOn),
+            date: fmtDate(tOnDuty),
+            dt: String(format: "%.1f", dtHours),
+            firstCoordinate: firstCoord, lastCoordinate: lastCoord,
+            dbgMaxTas: dbgMaxTas, dbgFfCount: ffCount, dbgFfMax: dbgFfMax
+        )
     }
 }
