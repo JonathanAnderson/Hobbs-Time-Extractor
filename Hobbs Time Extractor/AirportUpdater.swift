@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 enum AirportUpdater {
     // Raw GitHub URL for faa_airports.bin — update this when you move the file.
@@ -26,6 +27,7 @@ enum AirportUpdater {
     }
 
     /// Checks GitHub for a newer binary using If-Modified-Since.
+    /// Downloads, verifies checksum, validates binary format, then saves.
     /// Returns true if a new file was downloaded and saved.
     @discardableResult
     static func checkForUpdate() async -> Bool {
@@ -39,7 +41,18 @@ enum AirportUpdater {
               http.statusCode == 200
         else { return false }
 
-        // Validate before replacing the cached copy
+        // Fetch and verify SHA-256 checksum
+        let checksumURL = remoteURL.deletingPathExtension().appendingPathExtension("sha256")
+        guard let (checksumData, _) = try? await URLSession.shared.data(from: checksumURL),
+              let expectedHex = String(data: checksumData, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return false }
+
+        let computed = SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }.joined()
+        guard computed == expectedHex else { return false }
+
+        // Validate binary format before replacing cached copy
         guard (try? AirportBinaryReader.load(from: data)) != nil else { return false }
 
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

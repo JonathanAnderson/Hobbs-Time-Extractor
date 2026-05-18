@@ -26,7 +26,7 @@ from bs4 import BeautifulSoup
 BASE_URL = (
     "https://www.faa.gov/air_traffic/flight_info/aeronav/aero_data/NASR_Subscription/"
 )
-DEFAULT_BINARY_FILE = Path("faa_airports.bin")
+DEFAULT_BINARY_FILE = Path(__file__).parent / "output" / "faa_airports.bin"
 
 BINARY_MAGIC = b"FAAPT001"
 BINARY_HEADER_STRUCT = struct.Struct("<8sI")
@@ -617,6 +617,13 @@ def run_download(output_path: Path) -> None:
 
     log(f"Writing {output_path}...")
     database.write_binary_file(output_path)
+
+    import hashlib
+    checksum = hashlib.sha256(output_path.read_bytes()).hexdigest()
+    checksum_path = output_path.with_suffix(".sha256")
+    checksum_path.write_text(checksum + "\n", encoding="utf-8")
+    log(f"SHA-256: {checksum}")
+    log(f"Checksum written to {checksum_path}")
 
     print_summary(database, output_path)
 
