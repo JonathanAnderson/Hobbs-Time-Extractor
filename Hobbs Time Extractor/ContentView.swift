@@ -105,30 +105,41 @@ struct ContentView: View {
                 Text(errorMessage ?? "")
             }
             .task {
-                guard airports.isEmpty,
-                      let loaded = try? AirportBinaryReader.loadFromBundle()
-                else { return }
+                guard airports.isEmpty else { return }
+
+                // Load best available (cached download or bundle)
+                let loaded = AirportUpdater.load()
                 airports = loaded
-                records = records.map {
-                    let dep = nearestAirport(latitudeDegrees:  $0.flight.firstCoordinate?.latitude  ?? 0,
-                                             longitudeDegrees: $0.flight.firstCoordinate?.longitude ?? 0,
-                                             airports: loaded)
-                    let arr = nearestAirport(latitudeDegrees:  $0.flight.lastCoordinate?.latitude   ?? 0,
-                                             longitudeDegrees: $0.flight.lastCoordinate?.longitude  ?? 0,
-                                             airports: loaded)
-                    return FlightRecord(
-                        flight: $0.flight,
-                        departure: dep?.airport,
-                        arrival:   arr?.airport,
-                        departureDistanceKm: dep?.distanceKilometers,
-                        arrivalDistanceKm:   arr?.distanceKilometers
-                    )
+                backfillAirports(loaded)
+
+                // Check for a newer binary in the background
+                let updated = await AirportUpdater.checkForUpdate()
+                if updated {
+                    let fresh = AirportUpdater.load()
+                    airports = fresh
+                    backfillAirports(fresh)
                 }
             }
         }
     }
 
     // MARK: - Helpers
+
+    private func backfillAirports(_ snap: [AirportRecord]) {
+        guard !snap.isEmpty, !records.isEmpty else { return }
+        records = records.map {
+            let dep = nearestAirport(latitudeDegrees:  $0.flight.firstCoordinate?.latitude  ?? 0,
+                                     longitudeDegrees: $0.flight.firstCoordinate?.longitude ?? 0,
+                                     airports: snap)
+            let arr = nearestAirport(latitudeDegrees:  $0.flight.lastCoordinate?.latitude   ?? 0,
+                                     longitudeDegrees: $0.flight.lastCoordinate?.longitude  ?? 0,
+                                     airports: snap)
+            return FlightRecord(flight: $0.flight,
+                                departure: dep?.airport, arrival: arr?.airport,
+                                departureDistanceKm: dep?.distanceKilometers,
+                                arrivalDistanceKm:   arr?.distanceKilometers)
+        }
+    }
 
     // Parses URLs off the main thread, then appends results on main.
     private func importURLs(_ urls: [URL]) {
