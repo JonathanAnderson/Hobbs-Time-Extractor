@@ -9,6 +9,19 @@ import SwiftUI
 import UniformTypeIdentifiers
 import Foundation
 
+// MARK: - Font Scale Environment Key
+
+struct FontScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 1.0
+}
+
+extension EnvironmentValues {
+    var fontScale: CGFloat {
+        get { self[FontScaleKey.self] }
+        set { self[FontScaleKey.self] = newValue }
+    }
+}
+
 // MARK: - FlightRecord
 
 /// FlightTime paired with its nearest departure/arrival airports and distances.
@@ -24,6 +37,7 @@ struct FlightRecord: Identifiable, Sendable {
 // MARK: - ContentView
 
 struct ContentView: View {
+    @Environment(\.fontScale) private var fontScale
     @State private var showImporter = false
     @State private var records: [FlightRecord] = []
     @State private var airports: [AirportRecord] = []
@@ -232,7 +246,11 @@ struct ContentView: View {
                     Text(String(format: "%.1f h total", totalHours))
                         .fontWeight(.semibold)
                 }
+                #if os(macOS)
+                .font(.system(size: 13 * fontScale))
+                #else
                 .font(.subheadline)
+                #endif
             }
         }
         .listStyle(.inset)
@@ -243,9 +261,29 @@ struct ContentView: View {
 
 struct FlightRow: View {
     let record: FlightRecord
+    @Environment(\.fontScale) private var fontScale
 
     private var flight: FlightTime { record.flight }
     private var isParsed: Bool { flight.onDutyEpoch > 0 }
+
+    // Returns an explicit-size font on macOS (so fontScale takes effect),
+    // or the semantic equivalent on iOS (which respects Dynamic Type).
+    private func sf(size: CGFloat, weight: Font.Weight = .regular,
+                    mono: Bool = false, fallback: Font) -> Font {
+        #if os(macOS)
+        let f = Font.system(size: size * fontScale, weight: weight)
+        return mono ? f.monospacedDigit() : f
+        #else
+        return fallback
+        #endif
+    }
+
+    // UTC epoch → 4-digit HHMM string, e.g. 1504. Returns "----" when epoch is 0.
+    private func hhmm(_ epoch: Int) -> String {
+        guard epoch > 0 else { return "----" }
+        let s = (epoch + 30) % 86400
+        return String(format: "%02d%02d", s / 3600, (s % 3600) / 60)
+    }
 
     private var displayName: String {
         var n = flight.fileName
@@ -258,7 +296,7 @@ struct FlightRow: View {
             // Filename + Hobbs
             HStack(alignment: .firstTextBaseline) {
                 Text(displayName)
-                    .font(.subheadline.weight(.medium))
+                    .font(sf(size: 13, weight: .medium, fallback: .subheadline.weight(.medium)))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 8)
@@ -266,14 +304,14 @@ struct FlightRow: View {
                     VStack(alignment: .trailing, spacing: 0) {
                         HStack(alignment: .lastTextBaseline, spacing: 2) {
                             Text(flight.dt)
-                                .font(.title3.weight(.semibold).monospacedDigit())
+                                .font(sf(size: 20, weight: .semibold, mono: true, fallback: .title3.weight(.semibold).monospacedDigit()))
                                 .foregroundStyle(.tint)
                             Text("h")
-                                .font(.footnote.weight(.medium))
+                                .font(sf(size: 12, weight: .medium, fallback: .footnote.weight(.medium)))
                                 .foregroundStyle(.secondary)
                         }
                         Text("Hobbs")
-                            .font(.caption2)
+                            .font(sf(size: 10, fallback: .caption2))
                             .foregroundStyle(.tertiary)
                     }
                 } else {
@@ -284,9 +322,13 @@ struct FlightRow: View {
             }
 
             if isParsed {
+                // Compact HHMM Zulu summary: Out Off On In Beg End
+                Text("Out:\(hhmm(flight.timeOutEpoch))  Off:\(hhmm(flight.timeOffEpoch))  On:\(hhmm(flight.timeOnEpoch))  In:\(hhmm(flight.timeInEpoch))  Beg:\(hhmm(flight.onDutyEpoch))  End:\(hhmm(flight.offDutyEpoch))")
+                    .font(sf(size: 10, mono: true, fallback: .caption2.monospacedDigit()))
+                    .foregroundStyle(.secondary)
                 routeLabel
                 Text(flight.date)
-                    .font(.caption2)
+                    .font(sf(size: 10, fallback: .caption2))
                     .foregroundStyle(.tertiary)
                 timeRow("Hobbs",  flight.onDuty,  flight.offDuty)
                 if flight.timeOutEpoch > 0 || flight.timeInEpoch > 0 {
@@ -327,7 +369,7 @@ struct FlightRow: View {
     private func timeRow(_ label: String, _ start: String, _ end: String) -> some View {
         HStack(spacing: 4) {
             Text(label)
-                .frame(width: 48, alignment: .leading)
+                .frame(width: 48 * fontScale, alignment: .leading)
                 .foregroundStyle(.secondary)
             Text(start)
                 .monospacedDigit()
@@ -338,19 +380,19 @@ struct FlightRow: View {
             Text("UTC")
                 .foregroundStyle(.tertiary)
         }
-        .font(.caption)
+        .font(sf(size: 11, fallback: .caption))
     }
 
     private func debugRow(_ label: String, _ info: String) -> some View {
         HStack(alignment: .top, spacing: 4) {
             Text(label)
-                .frame(width: 48, alignment: .leading)
+                .frame(width: 48 * fontScale, alignment: .leading)
                 .foregroundStyle(.secondary)
             Text(info)
                 .foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .font(.caption.monospacedDigit())
+        .font(sf(size: 11, mono: true, fallback: .caption.monospacedDigit()))
     }
 
     @ViewBuilder
@@ -371,7 +413,7 @@ struct FlightRow: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .font(.caption.weight(.semibold))
+            .font(sf(size: 11, weight: .semibold, fallback: .caption.weight(.semibold)))
             .foregroundStyle(.tint)
         }
     }
