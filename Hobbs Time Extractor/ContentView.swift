@@ -205,7 +205,7 @@ struct ContentView: View {
                 .foregroundStyle(.quaternary)
             Text("No Flights")
                 .font(.title2.weight(.semibold))
-            Text("Import one or more Garmin G1000\nCSV export files to get started.")
+            Text("Import Garmin G1000 or G3X CSV logs.\nColumns are detected automatically.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -333,16 +333,24 @@ struct FlightRow: View {
                 timeRow("Hobbs",  flight.onDuty,  flight.offDuty)
                 if flight.timeOutEpoch > 0 || flight.timeInEpoch > 0 {
                     timeRow("Engine", flight.timeOut, flight.timeIn)
+                        .help("Detected using \(flight.engineSignal.label) > \(Int(flight.engineSignal.threshold)) \(flight.engineSignal.units)")
                 } else {
                     debugRow("Engine", engineDebug)
                 }
                 if flight.timeOffEpoch > 0 || flight.timeOnEpoch > 0 {
-                    timeRow("Flight", flight.timeOff, flight.timeOn)
+                    timeRow("Flight", flight.timeOffEpoch > 0 ? "≈\(flight.timeOff)" : "—",
+                            flight.timeOnEpoch > 0 ? "≈\(flight.timeOn)" : "—")
+                        .help(flight.flightDetectionNote)
+                    if flight.timeOffEpoch == 0 || flight.timeOnEpoch == 0 {
+                        Text(flight.timeOffEpoch == 0 ? "First takeoff not observed" : "Final landing not observed")
+                            .font(sf(size: 10, fallback: .caption2))
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     debugRow("Flight", flightDebug)
                 }
             } else {
-                Text("Could not parse file")
+                Text("Could not read Garmin date, time, and UTC offset columns.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -354,14 +362,13 @@ struct FlightRow: View {
 
     private var engineDebug: String {
         let f = flight
-        if f.dbgFfCount == 0 { return "no FFlow data" }
-        return String(format: "n=%d maxFF=%.2f gph (need >5)", f.dbgFfCount, f.dbgFfMax)
+        if f.dbgEngineCount == 0 { return "no \(f.engineSignal.label) data" }
+        return String(format: "n=%d max=%.2f %@ (need >%.0f)",
+                      f.dbgEngineCount, f.dbgEngineMax, f.engineSignal.units, f.engineSignal.threshold)
     }
 
     private var flightDebug: String {
-        let f = flight
-        if f.dbgMaxTas == 0 { return "no TAS data" }
-        return String(format: "maxTAS=%.0f kt (need >60)", f.dbgMaxTas)
+        flight.flightDetectionNote.isEmpty ? "No sustained flight detected" : flight.flightDetectionNote
     }
 
     // MARK: - Row helpers
@@ -449,7 +456,7 @@ private struct FlightListPreview: View {
                 date: "2025-03-17",
                 dt: "1.7",
                 firstCoordinate: nil, lastCoordinate: nil,
-                dbgMaxTas: 145, dbgFfCount: 45, dbgFfMax: 18.3
+                dbgMaxTas: 145, engineSignal: .fuelFlow, dbgEngineCount: 45, dbgEngineMax: 18.3
             ),
             departure: nil, arrival: nil,
             departureDistanceKm: 1.2, arrivalDistanceKm: 0.8
@@ -467,7 +474,7 @@ private struct FlightListPreview: View {
                 date: "2025-03-22",
                 dt: "3.2",
                 firstCoordinate: nil, lastCoordinate: nil,
-                dbgMaxTas: 34, dbgFfCount: 12, dbgFfMax: 0.18
+                dbgMaxTas: 34, engineSignal: .fuelFlow, dbgEngineCount: 12, dbgEngineMax: 0.18
             ),
             departure: nil, arrival: nil,
             departureDistanceKm: nil, arrivalDistanceKm: nil
@@ -483,7 +490,7 @@ private struct FlightListPreview: View {
                 timeOff: "—", timeOn: "—",
                 date: "—", dt: "",
                 firstCoordinate: nil, lastCoordinate: nil,
-                dbgMaxTas: 0, dbgFfCount: 0, dbgFfMax: 0
+                dbgMaxTas: 0, engineSignal: .fuelFlow, dbgEngineCount: 0, dbgEngineMax: 0
             ),
             departure: nil, arrival: nil,
             departureDistanceKm: nil, arrivalDistanceKm: nil

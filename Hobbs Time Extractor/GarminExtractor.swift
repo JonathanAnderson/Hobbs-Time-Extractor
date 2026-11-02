@@ -20,33 +20,55 @@ struct GarminRow {
     let longitude: Double?
     let tas: Double?       // True Airspeed (kt)
     let maxFFlow: Double?  // max fuel flow across all FFlow columns (gph)
+    let maxRPM: Double?    // max engine speed across all RPM columns
+    var groundSpeed: Double? = nil
+    var indicatedAirspeed: Double? = nil
+    var gpsAltitude: Double? = nil
+    var pressureAltitude: Double? = nil
+    var indicatedAltitude: Double? = nil
+    var recordedAGL: Double? = nil
+    var verticalSpeed: Double? = nil
 }
 
 // MARK: - GarminTimeReader
 
-/// Streaming iterator over a Garmin G1000 CSV. Yields one GarminRow per data line.
+/// Streaming reader for Garmin logs with either compact or descriptive column names.
+/// Timestamp, GPS, and engine columns are discovered independently from the header.
 class GarminTimeReader: Sequence, IteratorProtocol {
     private let fileHandle: FileHandle
     private let bufferSize: Int
     private var buffer = Data()
     private let url: URL
     private let hasAccess: Bool
-    private var lineNo: Int = 0
+    private var reachedEOF = false
     private let parser = GarminTimestampParser()
     private var colIndices: ColumnIndices?
+    private var hasData = false
+
+    private(set) var engineSignal: EngineSignal = .fuelFlow
 
     private struct ColumnIndices {
-        let latitude: Int
-        let longitude: Int
-        let gpsFix: Int
-        let hplWas: Int
-        let vplWas: Int
+        let date: Int
+        let time: Int
+        let utcOffset: Int
+        let latitude: Int?
+        let longitude: Int?
+        let gpsFix: Int?
+        let hplWas: Int?
+        let vplWas: Int?
         let tas: Int?
         let fflows: [Int]
+        let rpms: [Int]
+        let groundSpeed: Int?
+        let ias: Int?
+        let gpsAltitude: Int?
+        let pressureAltitude: Int?
+        let indicatedAltitude: Int?
+        let agl: Int?
+        let verticalSpeed: Int?
     }
 
     init?(url: URL, bufferSize: Int = 4_096) {
-        // startAccessingSecurityScopedResource returns false for bundle URLs (not an error).
         let access = url.startAccessingSecurityScopedResource()
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             if access { url.stopAccessingSecurityScopedResource() }
@@ -54,7 +76,7 @@ class GarminTimeReader: Sequence, IteratorProtocol {
         }
         self.url = url
         self.fileHandle = handle
-        self.bufferSize = bufferSize
+        self.bufferSize = Swift.max(1, bufferSize)
         self.hasAccess = access
     }
 
@@ -63,154 +85,229 @@ class GarminTimeReader: Sequence, IteratorProtocol {
         if hasAccess { url.stopAccessingSecurityScopedResource() }
     }
 
-    func next() -> GarminRow? {
+    private func nextLine() -> Data? {
         while true {
-            if let range = buffer.range(of: Data([0x0A])) {
-                lineNo += 1
-                let line = buffer[..<range.lowerBound]
-
-                if lineNo == 1 {
-                    let magic = Data("#airframe_info".utf8)
-                    if buffer.subdata(in: 0..<magic.count) != magic { return nil }
-                } else if lineNo == 2 {
-                    let magic = Data("#yyy-mm-dd, hh:mm:ss,   hh:mm,".utf8)
-                    if buffer.subdata(in: 0..<magic.count) != magic { return nil }
-                } else if lineNo == 3 {
-                    let magic = Data("  Lcl Date, Lcl Time, UTCOfst,".utf8)
-                    if buffer.subdata(in: 0..<magic.count) != magic { return nil }
-                    colIndices = parseColumnIndices(line)
-                }
-
-                if lineNo < 4 {
-                    buffer.removeSubrange(0..<range.upperBound)
-                    continue
-                }
-
-                let epochSec = parser.parse(buffer)
-                let gps    = colIndices.flatMap { parseGPS(line, indices: $0) }
-                let motion = colIndices.flatMap { parseMotion(line, indices: $0) }
-                buffer.removeSubrange(0..<range.upperBound)
-                return GarminRow(
-                    epochSec: epochSec,
-                    latitude: gps?.lat, longitude: gps?.lon,
-                    tas: motion?.tas, maxFFlow: motion?.maxFFlow
-                )
-            } else {
-                guard let chunk = try? fileHandle.read(upToCount: bufferSize),
-                      !chunk.isEmpty else { return nil }
-                buffer.append(chunk)
+            if let newline = buffer.firstIndex(of: 0x0A) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                return line
             }
+            if reachedEOF {
+                guard !buffer.isEmpty else { return nil }
+                let line = buffer
+                buffer = Data()
+                return line
+            }
+            guard let chunk = try? fileHandle.read(upToCount: bufferSize), !chunk.isEmpty else {
+                reachedEOF = true
+                continue
+            }
+            buffer.append(chunk)
         }
     }
 
-    private func parseColumnIndices(_ line: Data) -> ColumnIndices? {
-        guard let s = String(data: line, encoding: .ascii) else { return nil }
-        var map: [String: Int] = [:]
-        var fflowIndices: [Int] = []
-        for (i, col) in s.split(separator: ",", omittingEmptySubsequences: false).enumerated() {
-            let name = col.trimmingCharacters(in: .whitespaces)
-            map[name] = i
-            if name.contains("FFlow") { fflowIndices.append(i) }
+    func next() -> GarminRow? {
+        while let line = nextLine() {
+            // Some Garmin logs contain non-UTF-8 bytes in unrelated sensor fields.
+            // Replace those bytes so a valid timestamp is not discarded with them.
+            let text = String(decoding: line, as: UTF8.self)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF}"))
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"),
+                  let cols = Self.csvFields(trimmed) else { continue }
+
+            // GDU logs include both descriptive and compact headers. Either works;
+            // use the final recognized header before the first timestamped sample.
+            if !hasData, let indices = parseColumnIndices(cols) {
+                colIndices = indices
+                engineSignal = indices.rpms.isEmpty ? .fuelFlow : .rpm
+                continue
+            }
+            guard let indices = colIndices,
+                  let date = field(cols, at: indices.date),
+                  let time = field(cols, at: indices.time),
+                  let offset = field(cols, at: indices.utcOffset) else { continue }
+            let epoch = parser.parse(date: date, time: time, utcOffset: offset)
+            guard epoch > 0 else { continue }
+            hasData = true
+            let gps = parseGPS(cols, indices: indices)
+            return GarminRow(
+                epochSec: epoch, latitude: gps?.latitude, longitude: gps?.longitude,
+                tas: number(cols, at: indices.tas).flatMap { $0 >= 0 ? $0 : nil },
+                maxFFlow: indices.fflows.compactMap { number(cols, at: $0) }.filter { $0 >= 0 }.max(),
+                maxRPM: indices.rpms.compactMap { number(cols, at: $0) }.filter { $0 >= 0 }.max(),
+                groundSpeed: gpsFixIsValid(cols, indices: indices) ? number(cols, at: indices.groundSpeed) : nil,
+                indicatedAirspeed: number(cols, at: indices.ias),
+                gpsAltitude: gpsFixIsValid(cols, indices: indices) ? number(cols, at: indices.gpsAltitude) : nil,
+                pressureAltitude: number(cols, at: indices.pressureAltitude),
+                indicatedAltitude: number(cols, at: indices.indicatedAltitude),
+                recordedAGL: number(cols, at: indices.agl),
+                verticalSpeed: number(cols, at: indices.verticalSpeed)
+            )
         }
-        guard let lat = map["Latitude"], let lon = map["Longitude"],
-              let fix = map["GPSfix"], let hpl = map["HPLwas"], let vpl = map["VPLwas"]
-        else { return nil }
+        return nil
+    }
+
+    /// Garmin fields are normally unquoted. Also accept quoted CSV exports, including
+    /// embedded commas and escaped quotes; an unfinished quoted record is skipped.
+    private static func csvFields(_ line: String) -> [String]? {
+        if !line.contains("\"") {
+            return line.split(separator: ",", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        var fields: [String] = []
+        var field = ""
+        var quoted = false
+        var index = line.startIndex
+        while index < line.endIndex {
+            let ch = line[index]
+            let next = line.index(after: index)
+            if ch == "\"" {
+                if quoted, next < line.endIndex, line[next] == "\"" {
+                    field.append("\"")
+                    index = line.index(after: next)
+                    continue
+                }
+                quoted.toggle()
+            } else if ch == "," && !quoted {
+                fields.append(field.trimmingCharacters(in: .whitespacesAndNewlines))
+                field = ""
+            } else {
+                field.append(ch)
+            }
+            index = next
+        }
+        guard !quoted else { return nil }
+        fields.append(field.trimmingCharacters(in: .whitespacesAndNewlines))
+        return fields
+    }
+
+    private func parseColumnIndices(_ cols: [String]) -> ColumnIndices? {
+        // Descriptive aliases include units. Supported Garmin compact headers use
+        // knots for TAS and gallons/hour for FFlow.
+        let names = cols.map { $0.lowercased().filter { !$0.isWhitespace } }
+        func find(_ aliases: [String]) -> Int? {
+            names.firstIndex { aliases.contains($0) }
+        }
+        func engineColumns(shortName: String, descriptiveNames: [String]) -> [Int] {
+            names.indices.filter { index in
+                let name = names[index]
+                if name == shortName || descriptiveNames.contains(name) { return true }
+                // Compact engine names: E1 FFlow, E2 FFlow, E1 RPM, etc.
+                guard name.hasPrefix("e"), name.hasSuffix(shortName) else { return false }
+                let engine = name.dropFirst().dropLast(shortName.count)
+                return !engine.isEmpty && engine.allSatisfy { $0.isASCII && $0.isNumber }
+            }
+        }
+        guard let date = find(["lcldate", "localdate", "date", "date(yyyy-mm-dd)"]),
+              let time = find(["lcltime", "localtime", "time", "time(hh:mm:ss)"]),
+              let offset = find(["utcofst", "utcoffset", "utcoffset(hh:mm)"]) else { return nil }
         return ColumnIndices(
-            latitude: lat, longitude: lon, gpsFix: fix, hplWas: hpl, vplWas: vpl,
-            tas: map["TAS"], fflows: fflowIndices
+            date: date, time: time, utcOffset: offset,
+            latitude: find(["latitude", "latitude(deg)"]),
+            longitude: find(["longitude", "longitude(deg)"]),
+            gpsFix: find(["gpsfix", "gpsfixstatus"]),
+            hplWas: find(["hplwas"]), vplWas: find(["vplwas"]),
+            tas: find(["tas", "trueairspeed(kt)"]),
+            fflows: engineColumns(shortName: "fflow", descriptiveNames: ["fuelflow(gal/hour)", "fuelflow(gph)"]),
+            rpms: engineColumns(shortName: "rpm", descriptiveNames: ["enginespeed(rpm)"]),
+            groundSpeed: find(["gndspd", "gpsgroundspeed(kt)"]),
+            ias: find(["ias", "indicatedairspeed(kt)"]),
+            gpsAltitude: find(["altmsl"]) ?? find(["altgps", "gpsaltitude(ft)"]),
+            pressureAltitude: find(["altp", "pressurealtitude(ft)"]),
+            indicatedAltitude: find(["altind", "baroaltitude(ft)"]),
+            agl: find(["agl", "heightaboveground(ft)"]),
+            verticalSpeed: find(["vspd", "verticalspeed(ft/min)"])
         )
     }
 
-    private func parseGPS(_ line: Data, indices: ColumnIndices) -> (lat: Double, lon: Double)? {
-        guard let s = String(data: line, encoding: .ascii) else { return nil }
-        let cols = s.split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard cols.count > indices.latitude,
-              cols.count > indices.longitude,
-              cols.count > indices.gpsFix,
-              cols.count > indices.hplWas,
-              cols.count > indices.vplWas else { return nil }
-        guard cols[indices.gpsFix] == "3DDiff",
-              let hpl = Double(cols[indices.hplWas]), hpl < 100,
-              let vpl = Double(cols[indices.vplWas]), vpl < 100 else { return nil }
-        let latStr = cols[indices.latitude], lonStr = cols[indices.longitude]
-        guard !latStr.isEmpty, !lonStr.isEmpty,
-              let lat = Double(latStr), let lon = Double(lonStr) else { return nil }
-        return (lat, lon)
+    private func field(_ cols: [String], at index: Int?) -> String? {
+        guard let index, cols.indices.contains(index) else { return nil }
+        return cols[index]
     }
 
-    private func parseMotion(
-        _ line: Data, indices: ColumnIndices
-    ) -> (tas: Double?, maxFFlow: Double?)? {
-        guard indices.tas != nil || !indices.fflows.isEmpty else { return nil }
-        guard let s = String(data: line, encoding: .ascii) else { return nil }
-        let cols = s.split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-        func get(_ idx: Int?) -> Double? {
-            guard let idx, cols.count > idx else { return nil }
-            return Double(cols[idx])
+    private func number(_ cols: [String], at index: Int?) -> Double? {
+        guard let text = field(cols, at: index), let value = Double(text), value.isFinite else { return nil }
+        return value
+    }
+
+    private func gpsFixIsValid(_ cols: [String], indices: ColumnIndices) -> Bool {
+        if let index = indices.gpsFix {
+            guard let fix = field(cols, at: index)?.lowercased(),
+                  fix == "3ddiff" || fix == "3d" else { return false }
         }
-        let maxFF = indices.fflows.isEmpty ? nil : indices.fflows.compactMap { get($0) }.max()
-        return (tas: get(indices.tas), maxFFlow: maxFF)
+        return true
+    }
+
+    private func gpsQualityIsValid(_ cols: [String], indices: ColumnIndices) -> Bool {
+        guard gpsFixIsValid(cols, indices: indices) else { return false }
+        // Older G1000 logs include protection levels; GDU 465 logs do not.
+        // These limits filter airport coordinates, not the offline smoothed altitude
+        // profile: crossing VPL=100 must not turn touchdown into a later taxi sample.
+        for index in [indices.hplWas, indices.vplWas].compactMap({ $0 }) {
+            guard let level = number(cols, at: index), level >= 0, level < 100 else { return false }
+        }
+        return true
+    }
+
+    private func parseGPS(_ cols: [String], indices: ColumnIndices) -> Coordinate? {
+        guard gpsQualityIsValid(cols, indices: indices) else { return nil }
+        guard let lat = number(cols, at: indices.latitude), (-90...90).contains(lat),
+              let lon = number(cols, at: indices.longitude), (-180...180).contains(lon) else { return nil }
+        return Coordinate(latitude: lat, longitude: lon)
     }
 }
 
 // MARK: - GarminTimestampParser
 
-/// Parses a single Garmin G1000 CSV data row (cols 0–2) into a UTC epoch second.
-/// Zero-state value type; no Calendar or DateFormatter — safe to call in tight loops.
+/// Converts named local date/time/UTC-offset fields to UTC without DateFormatter.
 struct GarminTimestampParser {
-    // Input layout (first 30 bytes):
-    //   0123456789012345678901234567890
-    //             ,         ,        ,
-    //   2025-03-17, 09:59:11,  -05:00,
-    func parse(_ buffer: Data) -> Int {
-        var yyyy: Int32 = 0
-        var mo:   Int32 = 0
-        var dd:   Int32 = 0
-        var hh:   Int32 = 0
-        var mi:   Int32 = 0
-        var ss:   Int32 = 0
-        var tzs:  Int32 = 1
-        var tzh:  Int32 = 0
-        var tzm:  Int32 = 0
-
-        let skip: Set<UInt8> = [UInt8(ascii: " "), UInt8(ascii: ","), UInt8(ascii: ":")]
-
-        for (idx, byte) in buffer.enumerated() {
-            if idx >= 30 { break }
-            if skip.contains(byte) { continue }
-            if idx > 20 {
-                if byte == UInt8(ascii: "-") { tzs = -1; continue }
-                if byte == UInt8(ascii: "+") { tzs =  1; continue }
-            } else if byte == UInt8(ascii: "-") { continue }
-
-            let digit = Int32(byte) - Int32(UInt8(ascii: "0"))
-            if digit < 0 || digit > 9 { return 0 }
-
-            if idx <  4 { yyyy = yyyy * 10 + digit; continue }
-            if idx <  7 { mo   = mo   * 10 + digit; continue }
-            if idx < 10 { dd   = dd   * 10 + digit; continue }
-            if idx < 14 { hh   = hh   * 10 + digit; continue }
-            if idx < 17 { mi   = mi   * 10 + digit; continue }
-            if idx < 20 { ss   = ss   * 10 + digit; continue }
-            if idx < 26 { tzh  = tzh  * 10 + digit; continue }
-            if idx < 29 { tzm  = tzm  * 10 + digit; continue }
+    func parse(date: String, time: String, utcOffset: String) -> Int {
+        let d = Array(date.utf8), t = Array(time.utf8), z = Array(utcOffset.utf8)
+        guard d.count == 10, d[4] == 45, d[7] == 45,
+              t.count == 8, t[2] == 58, t[5] == 58,
+              z.count == 6, z[0] == 43 || z[0] == 45, z[3] == 58 else { return 0 }
+        func digits(_ bytes: [UInt8], _ range: Range<Int>) -> Int? {
+            var value = 0
+            for i in range {
+                guard (48...57).contains(bytes[i]) else { return nil }
+                value = value * 10 + Int(bytes[i] - 48)
+            }
+            return value
         }
-        if yyyy < 2020 || yyyy > 2100 { return 0 }
-        let dayEpoch    = epochDay(yyyy: yyyy, mm: mo, dd: dd) * 24 * 3600
-        let tzOffsetSec = Int(tzs * (tzh * 3600 + tzm * 60))
-        let timeSec     = Int(hh * 3600 + mi * 60 + ss)
-        return dayEpoch + timeSec - tzOffsetSec
-    }
+        guard let year = digits(d, 0..<4), (2020...2100).contains(year),
+              let month = digits(d, 5..<7), (1...12).contains(month),
+              let day = digits(d, 8..<10),
+              let hour = digits(t, 0..<2), hour < 24,
+              let minute = digits(t, 3..<5), minute < 60,
+              let second = digits(t, 6..<8), second < 60,
+              let zoneHour = digits(z, 1..<3), zoneHour <= 14,
+              let zoneMinute = digits(z, 4..<6), zoneMinute < 60,
+              zoneHour < 14 || zoneMinute == 0 else { return 0 }
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        let daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        guard (1...daysInMonth[month - 1]).contains(day) else { return 0 }
 
-    private func epochDay(yyyy: Int32, mm: Int32, dd: Int32) -> Int {
-        var y = yyyy
-        var m = mm
-        if m < 3 { y -= 1; m += 9 } else { m -= 3 }
-        let value = Int32(y * 1461 / 4) + Int32((m * 979 + 15) / 32) + dd - 719484
-        return Int(value)
+        // Gregorian days since 1970-01-01, including century leap-year rules.
+        let y = year - (month <= 2 ? 1 : 0)
+        let era = y / 400
+        let yoe = y - era * 400
+        let m = month + (month > 2 ? -3 : 9)
+        let doy = (153 * m + 2) / 5 + day - 1
+        let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
+        let offset = (zoneHour * 3600 + zoneMinute * 60) * (z[0] == 45 ? -1 : 1)
+        return days * 86400 + hour * 3600 + minute * 60 + second - offset
     }
+}
+
+/// Choose one engine signal per file so missing RPM samples cannot switch to fuel flow.
+enum EngineSignal: Sendable {
+    case rpm
+    case fuelFlow
+
+    var threshold: Double { self == .rpm ? 300 : 5 }
+    var label: String { self == .rpm ? "RPM" : "FFlow" }
+    var units: String { self == .rpm ? "rpm" : "gph" }
 }
 
 // MARK: - FlightTime
@@ -239,9 +336,11 @@ struct FlightTime: Sendable {
     let firstCoordinate: Coordinate?
     let lastCoordinate: Coordinate?
     // Debug: always populated, helps diagnose missed detections
-    let dbgMaxTas:  Double   // highest TAS seen in file (need >60 for flight)
-    let dbgFfCount: Int      // data points with FFlow seen
-    let dbgFfMax:   Double   // highest fuel flow seen (need >5 for engine)
+    let dbgMaxTas:  Double   // highest TAS seen in file
+    let engineSignal: EngineSignal
+    let dbgEngineCount: Int  // samples with the selected engine signal
+    let dbgEngineMax: Double // maximum RPM or fuel flow, depending on engineSignal
+    var flightDetectionNote: String = ""
 }
 
 // MARK: - GarminExtractor
@@ -285,7 +384,7 @@ enum GarminExtractor {
                 timeOff: "—", timeOn: "—",
                 date: "—", dt: "",
                 firstCoordinate: nil, lastCoordinate: nil,
-                dbgMaxTas: 0, dbgFfCount: 0, dbgFfMax: 0
+                dbgMaxTas: 0, engineSignal: .fuelFlow, dbgEngineCount: 0, dbgEngineMax: 0
             )
         }
 
@@ -299,18 +398,17 @@ enum GarminExtractor {
         var firstCoord: Coordinate? = nil
         var lastCoord:  Coordinate? = nil
 
-        // -- Engine detection: any engine running when max FFlow > 5 gph --
-        var ffCount = 0     // data points with FFlow present (debug)
+        // -- Engine detection: RPM > 300 where available, otherwise FFlow > 5 gph --
+        var engineCount = 0 // samples with the selected signal (debug)
         var tOut    = 0     // first engine start
         var tIn     = 0     // last engine stop (keeps updating)
 
-        // -- Takeoff / landing detection via TAS threshold --
-        var tOff = 0   // first time TAS > 60 kt
-        var tOn  = 0   // first time TAS < 40 kt after takeoff
+        // Motion/altitude samples for the offline, engine-independent detector.
+        var flightRows: [GarminRow] = []
 
         // -- Debug accumulators --
         var dbgMaxTas = 0.0
-        var dbgFfMax  = 0.0
+        var dbgEngineMax = 0.0
 
         for row in reader {
             guard row.epochSec > 24 * 3600 * 365 else { continue }
@@ -325,32 +423,27 @@ enum GarminExtractor {
                 lastCoord = Coordinate(latitude: lat, longitude: lon)
             }
 
-            // Engine detection: > 5 gph means at least one engine is running
-            if let ff = row.maxFFlow {
-                ffCount += 1
-                if ff > dbgFfMax { dbgFfMax = ff }
+            // RPM distinguishes low-idle running from fuel priming in piston logs.
+            let engineValue = reader.engineSignal == .rpm ? row.maxRPM : row.maxFFlow
+            if let value = engineValue {
+                engineCount += 1
+                dbgEngineMax = max(dbgEngineMax, value)
                 if tOut == 0 {
-                    if ff > 5.0 { tOut = t }
-                } else if ff <= 5.0 {
+                    if value > reader.engineSignal.threshold { tOut = t }
+                } else if value <= reader.engineSignal.threshold {
                     tIn = t
                 }
             }
 
-            // Takeoff / landing detection via TAS
-            // >60 kt → airborne; <40 kt after takeoff → landed
-            if let tas = row.tas {
-                if tas > dbgMaxTas { dbgMaxTas = tas }
-                if tOff == 0 && tas > 60.0 {
-                    tOff = t
-                } else if tOff > 0 && tOn == 0 && tas < 40.0 {
-                    tOn = t
-                }
-            }
+            flightRows.append(row)
+            if let tas = row.tas { dbgMaxTas = max(dbgMaxTas, tas) }
         }
 
-        // End-of-file fallbacks
-        if tOff > 0 && tOn == 0 { tOn = tOffDuty }
+        // Engine fallback is separate; never invent a landing at the end of a log.
         if tOut > 0 && tIn == 0 { tIn = tOffDuty }
+        let flight = FlightTrackAnalyzer.analyze(flightRows)
+        let tOff = flight.firstTakeoffEpoch
+        let tOn = flight.lastLandingEpoch
 
         guard tOnDuty > 0 else { return na() }
 
@@ -367,7 +460,9 @@ enum GarminExtractor {
             date: fmtDate(tOnDuty),
             dt: String(format: "%.1f", dtHours),
             firstCoordinate: firstCoord, lastCoordinate: lastCoord,
-            dbgMaxTas: dbgMaxTas, dbgFfCount: ffCount, dbgFfMax: dbgFfMax
+            dbgMaxTas: dbgMaxTas, engineSignal: reader.engineSignal,
+            dbgEngineCount: engineCount, dbgEngineMax: dbgEngineMax,
+            flightDetectionNote: flight.note
         )
     }
 }

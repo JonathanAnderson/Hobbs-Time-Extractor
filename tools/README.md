@@ -1,6 +1,41 @@
 # tools/
 
-Python scripts for generating app bundle assets. Run offline; output is checked into the app target.
+Developer tools for app bundle assets and flight-log diagnostics.
+
+## Flight-motion diagnostics
+
+Generate diagnostic files outside the app to inspect the flight detector. The exporter
+runs the same Swift parser and flight analysis as the app; charts contain no engine
+readings and are not part of the app UI.
+
+From the repository root, export one or more logs:
+
+```sh
+tools/debug-flight.sh /path/to/log.csv /path/to/another-log.csv
+```
+
+This requires the macOS Swift command-line tools. It writes one `.flight.json` file
+per log to `debug/flights/`, which Git ignores. Use `-o /path/to/output` to choose a
+different directory. The JSON contains raw timestamped airspeed, groundspeed,
+altitude, recorded AGL, and vertical-speed readings; smoothed altitude and estimated
+AGL; recording segment identifiers; and detected flight boundaries. Missing values
+remain absent rather than being replaced with zero. No raw logs are copied.
+
+Render shareable PNG charts with [uv](https://github.com/astral-sh/uv):
+
+```sh
+uv run tools/plot-flight.py debug/flights/*.flight.json
+```
+
+Matplotlib is declared in the script and installed automatically by `uv`. Each PNG
+is saved beside its input JSON, or in a directory supplied with `-o`. The three
+panels show altitude, recorded versus estimated AGL, and speed in UTC. Green and red
+lines mark the first takeoff and final landing; dotted lines show other detected
+flight boundaries. Lines break at missing measurements and recording gaps.
+
+Estimated height is relative to taxi elevations; terrain is not modeled. It is kept
+separate from recorded AGL and is not a terrain-clearance measurement.
+The chart includes the analyzer's notes so uncertain detections remain visible.
 
 ## faa_airports.py
 
